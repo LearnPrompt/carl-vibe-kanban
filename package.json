@@ -1,0 +1,16 @@
+{
+  "name": "agent-board",
+  "version": "0.2.0",
+  "description": "Agent-agnostic markdown task board CLI for multi-repo, multi-agent workflows.",
+  "type": "module",
+  "bin": {
+    "board": "bin/board.mjs"
+  },
+  "scripts": {
+    "test": "node --test lib/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,1419 @@
+#!/usr/bin/env node
+// board — agent-agnostic markdown task board CLI. Zero npm dependencies.
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { execSync, spawnSync } from "node:child_process";
+
+import * as git from "../lib/git.mjs";
+import * as gh from "../lib/gh.mjs";
+import { deriveStatus, deriveFlags, deriveWorktreeState, deriveStage, deriveConflicts } from "../lib/derive.mjs";
+import * as store from "../lib/store.mjs";
+import { renderBoardHtml } from "../lib/render.mjs";
+import * as sessionsLib from "../lib/sessions.mjs";
+
+const DEFAULT_CONFIG = {
+  base: "main",
+  worktreeRoot: "~/agent-workbench/worktrees",
+  copy: [".env.local"],
+  link: [],
+  discover: ["worktrees", "prs"],
+  staleDays: 7,
+  archiveDays: 14,
+  aliases: [],
+  agents: { claude: "claude", codex: "codex" },
+};
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function resolveBoardRoot() {
+  if (process.env.BOARD_HOME) {
+    return path.resolve(git.expandHome(process.env.BOARD_HOME));
+  }
+  const root = git.getMainWorktreeRoot(process.cwd());
+  if (!root) {
+    throw new Error("无法定位 git 主工作树，且未设置 BOARD_HOME");
+  }
+  return root;
+}
+
+// The "real" main worktree, used only to exclude it from auto-discovery.
+// Always resolved via git-common-dir, ignoring BOARD_HOME, per spec B/I.
+function resolveRealMainWorktreeRoot(boardRoot) {
+  return git.getMainWorktreeRoot(boardRoot) || boardRoot;
+}
+
+function loadRepoConfig(boardRoot) {
+  const configPath = path.join(boardRoot, "board", "board.config.json");
+  if (!fs.existsSync(configPath)) return { ...DEFAULT_CONFIG };
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    return { ...DEFAULT_CONFIG, ...raw };
+  } catch (err) {
+    console.error(`WARN 读取 board.config.json 失败，使用默认配置: ${err.message}`);
+    return { ...DEFAULT_CONFIG };
+  }
+}
+
+// board-spec-v0.2 §模式判定: a repo with no board/board.config.json yet gets one
+// auto-created on its first `sync`, seeded with an alias derived from its own
+// directory name (lowercased) so app-title matching (sessions.mjs
+// appTitleMatchesAlias) works out of the box. Read-only commands (ls, sessions
+// ls, render) use plain loadRepoConfig() above and never write this file.
+function loadOrInitRepoConfig(boardRoot) {
+  const configPath = path.join(boardRoot, "board", "board.config.json");
+  if (fs.existsSync(configPath)) return loadRepoConfig(boardRoot);
+  const alias = path.basename(boardRoot).toLowerCase();
+  const cfg = { ...DEFAULT_CONFIG, aliases: [alias] };
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
+  return cfg;
+}
+
+// ~/.config/board/config.json is a pre-existing user-level file (previously
+// only `on_done`); board-spec-v0.2 adds a `workspace` section alongside it.
+// Reading/writing here always preserves whichever of the two the caller isn't
+// touching (see the `repos` acceptance step: on_done must survive).
+function userConfigPath() {
+  return path.join(os.homedir(), ".config", "board", "config.json");
+}
+
+function loadUserConfig() {
+  const p = userConfigPath();
+  if (!fs.existsSync(p)) return { on_done: "", workspace: null };
+  try {
+    const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+    return { on_done: raw.on_done || "", workspace: raw.workspace || null };
+  } catch {
+    return { on_done: "", workspace: null };
+  }
+}
+
+function loadUserOnDone() {
+  return loadUserConfig().on_done;
+}
+
+function requireWorkspaceRepos() {
+  const { workspace } = loadUserConfig();
+  if (!workspace || !Array.isArray(workspace.repos) || workspace.repos.length === 0) {
+    throw new Error(
+      `工作区模式需要在 ${userConfigPath()} 配置 workspace.repos（见 board-spec-v0.2 §多仓工作区）`
+    );
+  }
+  return workspace.repos;
+}
+
+// Machine-local, shared across every repo in the workspace (sessions.mjs
+// caches live here now, not under any single repo's board/.cache/). Falls
+// back to ~/.cache/board when workspace.cache isn't configured (or there's no
+// workspace config at all yet) so single-repo mode still works standalone.
+function resolveCacheDir() {
+  const { workspace } = loadUserConfig();
+  const dir =
+    workspace && workspace.cache
+      ? path.resolve(git.expandHome(workspace.cache))
+      : path.join(os.homedir(), ".cache", "board");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+// board-spec-v0.2 §模式判定: --all forces workspace mode; otherwise workspace
+// mode is also entered automatically when not inside any git repo (and
+// BOARD_HOME isn't set to one) — e.g. running from ~/agent-workbench itself.
+function isWorkspaceMode(flags) {
+  if (flags && flags.all) return true;
+  if (process.env.BOARD_HOME) return false;
+  return git.getMainWorktreeRoot(process.cwd()) === null;
+}
+
+// board-spec-v0.2 §主工作树写入说明 / repoRootOverride: a workspace.repos entry
+// is used VERBATIM as repoRoot — never reduced to its main worktree via
+// git-common-dir. This is what lets goodcaseai temporarily point at the
+// feat/board-v0 worktree (`~/agent-workbench/worktrees/goodcase-board`)
+// instead of `~/projects/goodcaseai` (which is checked out to main) without
+// any repo-specific special-casing in the code.
+function probeConfiguredRepo(rawPath) {
+  const repoRoot = path.resolve(git.expandHome(rawPath));
+  if (!fs.existsSync(repoRoot)) return { ok: false, reason: "路径不存在" };
+  if (!git.isGitRepo(repoRoot)) return { ok: false, reason: "不是 git 仓库" };
+  return { ok: true, repoRoot, repoLabel: resolveRepoLabel(repoRoot) };
+}
+
+// Prefers the GitHub remote's repo name (stable even when repoRoot is a
+// worktree with a different directory name, e.g. the goodcaseai override
+// above) and falls back to the directory basename when there's no remote.
+function resolveRepoLabel(repoRoot) {
+  const parsed = git.parseGithubRemote(git.getOriginUrl(repoRoot));
+  return (parsed && parsed.repo) || path.basename(repoRoot);
+}
+
+// board-spec-v0.2 §CLI: iterates workspace.repos, printing `SKIP <path> 原因`
+// for missing/non-git entries and calling `fn(probe)` for the rest.
+function forEachWorkspaceRepo(fn) {
+  const repos = requireWorkspaceRepos();
+  for (const p of repos) {
+    const probe = probeConfiguredRepo(p);
+    if (!probe.ok) {
+      console.log(`SKIP ${p}  ${probe.reason}`);
+      continue;
+    }
+    fn(probe);
+  }
+}
+
+function safeRealpath(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+// Shared git/gh facts used by both card sync and session scanning/matching
+// (board-spec-v0.1). `prList` here always resolves to an array (never null)
+// so session matching degrades gracefully when `gh` is unavailable.
+// `config.aliases` (board.config.json) rides along here because it's a
+// repo-identity fact just like repoOwner/repoName — it's how sessions.mjs's
+// prNumber fallback recognizes "this repo" for app-only rows with no
+// transcript (board-spec-v0.1 §prNumber 兜底加仓库守卫 guard b).
+function buildGitCtx(boardRoot, config) {
+  const localBranches = git.listLocalBranches(boardRoot);
+  const remoteBranches = git.listRemoteBranches(boardRoot);
+  const worktreeEntries = git.listWorktrees(boardRoot);
+  const prList = gh.listPRs(boardRoot);
+  const originUrl = git.getOriginUrl(boardRoot);
+  const parsedRemote = git.parseGithubRemote(originUrl) || {};
+  return {
+    localBranches,
+    remoteBranches,
+    worktreeEntries,
+    prList: prList || [],
+    prListOk: prList !== null,
+    repoOwner: parsedRemote.owner || null,
+    repoName: parsedRemote.repo || null,
+    aliases: (config && config.aliases) || [],
+  };
+}
+
+// --- core sync ---------------------------------------------------------------
+
+function runSync(boardRoot, config, opts = {}) {
+  const { dryRun = false, discover = true, fetch = false, repoLabel } = opts;
+  const effectiveRepoLabel = repoLabel || resolveRepoLabel(boardRoot);
+  const { tasksDir } = store.ensureBoardDirs(boardRoot);
+
+  if (fetch) git.fetchOrigin(boardRoot);
+
+  const mainRootResolved = safeRealpath(resolveRealMainWorktreeRoot(boardRoot));
+  const rawWorktrees = git.listWorktrees(boardRoot);
+  const discoverableWorktrees = rawWorktrees.filter((w) => {
+    if (!w.path || w.bare) return false;
+    return safeRealpath(w.path) !== mainRootResolved;
+  });
+
+  const worktreesByBranch = new Map();
+  const detachedWorktrees = [];
+  for (const w of discoverableWorktrees) {
+    if (w.branch) worktreesByBranch.set(w.branch, w);
+    else detachedWorktrees.push(w);
+  }
+
+  const localBranches = git.listLocalBranches(boardRoot);
+  const remoteBranches = git.listRemoteBranches(boardRoot);
+
+  const prListResult = gh.listPRs(boardRoot);
+  const output = [];
+  if (prListResult === null) {
+    output.push("WARN gh pr list 失败，PR 信息保留旧值");
+  }
+
+  const existingCardFiles = store.readAllCards(tasksDir);
+  const archivedIds = new Set(store.listArchivedIds(boardRoot));
+
+  const registry = new Map();
+  for (const c of existingCardFiles) {
+    registry.set(c.data.id, { data: { ...c.data }, body: c.body, isNew: false, filePath: c.filePath });
+  }
+
+  function considerNewCard(naturalKey, seedFields) {
+    const id = store.computeId(naturalKey);
+    if (registry.has(id)) return;
+    if (archivedIds.has(id)) return;
+    registry.set(id, {
+      data: {
+        id,
+        title: seedFields.title,
+        branch: seedFields.branch ?? null,
+        next_step: "",
+        evidence: [],
+        agent: null,
+        status_pinned: false,
+        status: "backlog",
+        created: nowIso(),
+        keys: [naturalKey],
+      },
+      body: "",
+      isNew: true,
+    });
+  }
+
+  const discoverList = discover ? config.discover || [] : [];
+
+  if (discoverList.includes("worktrees")) {
+    for (const wt of discoverableWorktrees) {
+      if (wt.branch) {
+        const pr = prListResult ? gh.pickPrForBranch(prListResult, wt.branch) : null;
+        considerNewCard(wt.branch, { title: pr ? pr.title : wt.branch, branch: wt.branch });
+      } else {
+        considerNewCard(wt.path, { title: `detached: ${path.basename(wt.path)}`, branch: null });
+      }
+    }
+  }
+
+  if (discoverList.includes("prs") && prListResult) {
+    for (const pr of prListResult) {
+      if (pr.state !== "OPEN") continue;
+      considerNewCard(pr.headRefName, { title: pr.title, branch: pr.headRefName });
+    }
+  }
+
+  const now = new Date();
+  const nowIsoStr = now.toISOString();
+  const doneTransitions = [];
+
+  // --- pass 1: everything except conflicts_with (needs every branch's diff first) ---
+
+  const computed = [];
+  for (const [id, entry] of registry) {
+    const data = entry.data;
+    const hasBranch = data.branch !== null && data.branch !== undefined;
+
+    let branchLocation = null;
+    let worktreeEntry = null;
+    if (hasBranch) {
+      branchLocation = git.resolveBranchLocation(data.branch, localBranches, remoteBranches);
+      worktreeEntry = worktreesByBranch.get(data.branch) || null;
+    } else {
+      const candidatePaths = [data.worktree, ...(data.keys || [])].filter(Boolean);
+      worktreeEntry = detachedWorktrees.find((w) => candidatePaths.includes(w.path)) || null;
+    }
+
+    let prFields;
+    if (hasBranch && prListResult) {
+      prFields = gh.mapPrToFields(gh.pickPrForBranch(prListResult, data.branch));
+    } else if (hasBranch) {
+      prFields = { pr: data.pr ?? null, pr_state: data.pr_state ?? null, pr_url: data.pr_url ?? null };
+    } else {
+      prFields = { pr: null, pr_state: null, pr_url: null };
+    }
+
+    let mergedIntoBase = false;
+    if (hasBranch && branchLocation) {
+      mergedIntoBase = git.isBranchMergedIntoBase(boardRoot, data.branch, config.base, branchLocation);
+    }
+
+    let lastCommit = null;
+    let ahead = null;
+    let behind = null;
+    if (hasBranch && branchLocation) {
+      const ref = git.branchRefFor(data.branch, branchLocation);
+      lastCommit = git.getLastCommit(boardRoot, ref);
+      const ab = git.getAheadBehind(boardRoot, ref, config.base);
+      ahead = ab.ahead;
+      behind = ab.behind;
+    } else if (!hasBranch && worktreeEntry && worktreeEntry.head) {
+      lastCommit = git.getLastCommit(boardRoot, worktreeEntry.head);
+    }
+
+    const worktreeState = deriveWorktreeState(worktreeEntry);
+    const pinned = data.status_pinned === true;
+    const priorStatus = data.status || "backlog";
+
+    const statusFacts = {
+      hasBranch,
+      branchLocation,
+      prState: prFields.pr_state,
+      mergedIntoBase,
+      hasWorktree: !!worktreeEntry,
+    };
+    const status = deriveStatus({ pinned, pinnedStatus: data.status, priorStatus }, statusFacts);
+
+    // board-spec-v0.1: stage + dirty_files + unpushed_commits.
+    const hasLocalBranch = hasBranch && branchLocation === "local";
+    const hasOriginBranch = hasBranch && (branchLocation === "origin" || remoteBranches.includes(data.branch));
+    const dirtyFiles = worktreeEntry ? git.getWorktreeDirtyFileCount(worktreeEntry.path) : 0;
+    let unpushedCommits = 0;
+    if (hasLocalBranch && hasOriginBranch) {
+      unpushedCommits = git.getUnpushedCommitCount(boardRoot, data.branch) ?? 0;
+    } else if (hasLocalBranch) {
+      unpushedCommits = ahead ?? 0;
+    }
+    const stage = hasBranch
+      ? deriveStage({
+          prState: prFields.pr_state,
+          hasLocalBranch,
+          hasOriginBranch,
+          dirtyFiles,
+          unpushedCommits,
+        })
+      : null;
+
+    // Changed-file set vs base, for pairwise conflict detection (pass 2).
+    // Only computed for branches that are still "active" per spec.
+    let changedFiles = [];
+    if (hasBranch && branchLocation && !["merged", "closed", "missing"].includes(stage)) {
+      const ref = git.branchRefFor(data.branch, branchLocation);
+      changedFiles = git.getChangedFiles(boardRoot, config.base, ref);
+    }
+
+    computed.push({
+      id,
+      entry,
+      data,
+      hasBranch,
+      branchLocation,
+      worktreeEntry,
+      prFields,
+      lastCommit,
+      ahead,
+      behind,
+      worktreeState,
+      pinned,
+      status,
+      stage,
+      dirtyFiles,
+      unpushedCommits,
+      changedFiles,
+    });
+  }
+
+  // --- conflicts_with: pairwise file-set intersection across active branches ---
+
+  const conflictInputs = computed
+    .filter((c) => c.hasBranch && !["merged", "closed", "missing"].includes(c.stage))
+    .map((c) => ({ branch: c.data.branch, files: c.changedFiles }));
+  const conflictsMap = deriveConflicts(conflictInputs);
+
+  // --- pass 2: finalize fields (flags now know about stage + conflicts), diff, write ---
+
+  for (const c of computed) {
+    const { id, entry, data, hasBranch, branchLocation, worktreeEntry, prFields, lastCommit, ahead, behind, worktreeState, pinned, status, stage, dirtyFiles, unpushedCommits } = c;
+
+    const conflictsWith = hasBranch ? conflictsMap[data.branch] || [] : [];
+
+    const flags = deriveFlags({
+      hasBranch,
+      branchLocation,
+      worktreePrunable: worktreeEntry ? !!worktreeEntry.prunable : false,
+      prState: prFields.pr_state,
+      status,
+      lastCommitAt: lastCommit ? lastCommit.date : null,
+      now,
+      staleDays: config.staleDays ?? 7,
+      nextStep: data.next_step,
+      stage,
+      hasConflicts: conflictsWith.length > 0,
+    });
+
+    const keys = store.unionKeys(
+      data.keys,
+      hasBranch ? [data.branch] : [data.worktree || (worktreeEntry ? worktreeEntry.path : null)].filter(Boolean)
+    );
+
+    const finalFields = {
+      id,
+      repo: effectiveRepoLabel,
+      title: data.title,
+      branch: hasBranch ? data.branch : null,
+      worktree: worktreeEntry ? worktreeEntry.path : null,
+      worktree_state: worktreeState,
+      pr: prFields.pr,
+      pr_state: prFields.pr_state,
+      pr_url: prFields.pr_url,
+      last_commit: lastCommit ? lastCommit.sha : null,
+      last_commit_at: lastCommit ? lastCommit.date : null,
+      last_commit_msg: lastCommit ? lastCommit.msg : null,
+      ahead,
+      behind,
+      stage,
+      dirty_files: dirtyFiles,
+      unpushed_commits: unpushedCommits,
+      base: config.base,
+      status,
+      status_pinned: pinned,
+      agent: data.agent ?? null,
+      evidence: data.evidence || [],
+      next_step: data.next_step || "",
+      created: data.created || nowIsoStr,
+      updated: nowIsoStr,
+      flags,
+      conflicts_with: conflictsWith,
+      keys,
+    };
+
+    const builtData = store.buildCardData(finalFields);
+
+    let changed;
+    if (entry.isNew) {
+      changed = true;
+    } else {
+      const originalBuilt = store.buildCardData(entry.data);
+      changed = !store.cardsEqualIgnoringUpdated(builtData, originalBuilt);
+    }
+
+    let effectiveUpdated = entry.data.updated || nowIsoStr;
+
+    if (changed) {
+      effectiveUpdated = nowIsoStr;
+      if (entry.isNew) {
+        output.push(`NEW ${id}  status: ${status}  (${finalFields.title})`);
+      } else {
+        const statusChangeStr = entry.data.status !== status ? `status: ${entry.data.status} → ${status}  ` : "";
+        const oldFlags = entry.data.flags || [];
+        const addedFlags = flags.filter((f) => !oldFlags.includes(f));
+        const flagStr = addedFlags.length ? `+flags: ${addedFlags.join(",")}  ` : "";
+        const descriptor = statusChangeStr || flagStr ? `${statusChangeStr}${flagStr}` : "updated  ";
+        output.push(`${id}  ${descriptor}(${finalFields.title})`);
+      }
+      if (!dryRun) {
+        store.writeCardFile(tasksDir, id, builtData, entry.body || "");
+      }
+      if (entry.data.status !== "done" && status === "done") {
+        doneTransitions.push(id);
+      }
+    }
+
+    // Archive check (rule N): done/dropped cards untouched for archiveDays.
+    if (status === "done" || status === "dropped") {
+      const ageDays = (now.getTime() - new Date(effectiveUpdated).getTime()) / (24 * 60 * 60 * 1000);
+      if (ageDays > (config.archiveDays ?? 14)) {
+        output.push(`ARCHIVE ${id}  (${finalFields.title})`);
+        if (!dryRun) {
+          store.moveCardToArchive(boardRoot, id);
+        }
+      }
+    }
+  }
+
+  if (!dryRun && doneTransitions.length > 0) {
+    const onDone = loadUserOnDone();
+    if (onDone) {
+      try {
+        execSync(onDone, { cwd: boardRoot, stdio: "inherit" });
+      } catch (err) {
+        output.push(`WARN on_done 命令执行失败: ${err.message}`);
+      }
+    }
+  }
+
+  const hasRealOutput = output.some((line) => !line.startsWith("WARN"));
+  if (!hasRealOutput) {
+    output.push("no changes");
+  }
+
+  return output;
+}
+
+// --- ls ------------------------------------------------------------------
+
+function printCardsTable(cards, args, { withRepo }) {
+  let filtered = cards;
+  if (args.status) filtered = filtered.filter((c) => c.status === args.status);
+  if (args.flag) filtered = filtered.filter((c) => (c.flags || []).includes(args.flag));
+
+  if (args.json) {
+    console.log(JSON.stringify(filtered));
+    return;
+  }
+
+  if (filtered.length === 0) {
+    console.log("(no cards)");
+    return;
+  }
+
+  const rows = filtered.map((c) => ({
+    ...(withRepo ? { repo: c.repo || "-" } : {}),
+    id: c.id,
+    status: c.status,
+    stage: c.stage || "-",
+    branch: c.branch || "(detached)",
+    pr: c.pr ? `#${c.pr}(${c.pr_state})` : "-",
+    agent: c.agent || "-",
+    flags: (c.flags || []).join(",") || "-",
+    conflicts: (c.conflicts_with || []).join(",") || "-",
+    title: c.title,
+  }));
+
+  const cols = [
+    ...(withRepo ? ["repo"] : []),
+    "id",
+    "status",
+    "stage",
+    "branch",
+    "pr",
+    "agent",
+    "flags",
+    "conflicts",
+    "title",
+  ];
+  const widths = {};
+  for (const col of cols) {
+    widths[col] = Math.max(col.length, ...rows.map((r) => String(r[col]).length));
+  }
+  const header = cols.map((c) => c.padEnd(widths[c])).join("  ");
+  console.log(header);
+  console.log(cols.map((c) => "-".repeat(widths[c])).join("  "));
+  for (const r of rows) {
+    console.log(cols.map((c) => String(r[c]).padEnd(widths[c])).join("  "));
+  }
+}
+
+function cmdLs(args) {
+  if (isWorkspaceMode(args)) {
+    let allCards = [];
+    forEachWorkspaceRepo((probe) => {
+      const tasksDir = store.tasksDirFor(probe.repoRoot);
+      const cards = store.readAllCards(tasksDir).map((c) => ({ ...c.data, repo: c.data.repo || probe.repoLabel }));
+      allCards = allCards.concat(cards);
+    });
+    printCardsTable(allCards, args, { withRepo: true });
+    return;
+  }
+  const boardRoot = resolveBoardRoot();
+  const tasksDir = store.tasksDirFor(boardRoot);
+  const cards = store.readAllCards(tasksDir).map((c) => c.data);
+  printCardsTable(cards, args, { withRepo: false });
+}
+
+// --- repos -----------------------------------------------------------------
+
+function cmdRepos() {
+  forEachWorkspaceRepo((probe) => {
+    const configPath = path.join(probe.repoRoot, "board", "board.config.json");
+    const hasConfig = fs.existsSync(configPath);
+    const tasksDir = store.tasksDirFor(probe.repoRoot);
+    const cardCount = fs.existsSync(tasksDir) ? store.readAllCards(tasksDir).length : 0;
+    console.log(
+      `${probe.repoLabel}  ${probe.repoRoot}  ${hasConfig ? "已配置" : "缺 board 配置"}  卡片 ${cardCount}`
+    );
+  });
+}
+
+// --- add -------------------------------------------------------------------
+
+function cmdAdd(args) {
+  if (!args.branch) {
+    console.error("用法: board add --branch <b> [--title t] [--agent a]");
+    process.exit(1);
+  }
+  const boardRoot = resolveBoardRoot();
+  const config = loadOrInitRepoConfig(boardRoot);
+  const { tasksDir } = store.ensureBoardDirs(boardRoot);
+
+  const id = store.computeId(args.branch);
+  const existingPath = path.join(tasksDir, `${id}.md`);
+  if (fs.existsSync(existingPath)) {
+    console.error(`已存在卡片 ${id}（branch=${args.branch}）`);
+    process.exit(1);
+  }
+
+  const now = nowIso();
+  const fields = {
+    id,
+    title: args.title || args.branch,
+    branch: args.branch,
+    next_step: "",
+    evidence: [],
+    agent: args.agent || null,
+    status_pinned: false,
+    status: "backlog",
+    created: now,
+    updated: now,
+    flags: [],
+    keys: [args.branch],
+  };
+  store.writeCardFile(tasksDir, id, store.buildCardData(fields), "");
+  console.log(`created ${id}`);
+
+  const lines = runSync(boardRoot, config, { discover: false, repoLabel: resolveRepoLabel(boardRoot) });
+  for (const l of lines) console.log(l);
+}
+
+// --- next / evidence / pin / unpin -----------------------------------------
+
+function loadCardOrExit(boardRoot, id) {
+  const tasksDir = store.tasksDirFor(boardRoot);
+  const filePath = path.join(tasksDir, `${id}.md`);
+  if (!fs.existsSync(filePath)) {
+    console.error(`未找到卡片 ${id}`);
+    process.exit(1);
+  }
+  return store.readCardFile(filePath);
+}
+
+function cmdNext(id, text) {
+  const boardRoot = resolveBoardRoot();
+  const tasksDir = store.tasksDirFor(boardRoot);
+  const card = loadCardOrExit(boardRoot, id);
+  const data = { ...card.data, next_step: text, updated: nowIso() };
+  store.writeCardFile(tasksDir, id, store.buildCardData(data), card.body);
+  console.log(`${id} next_step 已更新`);
+}
+
+function cmdEvidence(id, text) {
+  const boardRoot = resolveBoardRoot();
+  const tasksDir = store.tasksDirFor(boardRoot);
+  const card = loadCardOrExit(boardRoot, id);
+  const evidence = [...(card.data.evidence || []), text];
+  const data = { ...card.data, evidence, updated: nowIso() };
+  store.writeCardFile(tasksDir, id, store.buildCardData(data), card.body);
+  console.log(`${id} evidence 已追加`);
+}
+
+function cmdPin(id, status) {
+  const validStatuses = ["backlog", "doing", "review", "blocked", "done", "dropped"];
+  if (!validStatuses.includes(status)) {
+    console.error(`非法 status: ${status}，可选: ${validStatuses.join(", ")}`);
+    process.exit(1);
+  }
+  const boardRoot = resolveBoardRoot();
+  const tasksDir = store.tasksDirFor(boardRoot);
+  const card = loadCardOrExit(boardRoot, id);
+  const data = { ...card.data, status, status_pinned: true, updated: nowIso() };
+  store.writeCardFile(tasksDir, id, store.buildCardData(data), card.body);
+  console.log(`${id} pinned -> ${status}`);
+}
+
+function cmdUnpin(id) {
+  const boardRoot = resolveBoardRoot();
+  const tasksDir = store.tasksDirFor(boardRoot);
+  const card = loadCardOrExit(boardRoot, id);
+  const data = { ...card.data, status_pinned: false, updated: nowIso() };
+  store.writeCardFile(tasksDir, id, store.buildCardData(data), card.body);
+  console.log(`${id} unpinned`);
+}
+
+// --- archive -----------------------------------------------------------------
+
+function cmdArchive(id) {
+  const boardRoot = resolveBoardRoot();
+  const ok = store.moveCardToArchive(boardRoot, id);
+  if (!ok) {
+    console.error(`未找到卡片 ${id}`);
+    process.exit(1);
+  }
+  console.log(`${id} archived`);
+}
+
+// --- init ---------------------------------------------------------------------
+
+// Scans ~/projects/* for directories that look like git repos (a `.git` file
+// or dir present), for the --repos-less confirmation flow below. Never
+// touches disk beyond reading directory entries.
+function scanCandidateRepos() {
+  const projectsDir = path.join(os.homedir(), "projects");
+  if (!fs.existsSync(projectsDir)) return [];
+  return fs
+    .readdirSync(projectsDir, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => path.join(projectsDir, d.name))
+    .filter((p) => fs.existsSync(path.join(p, ".git")))
+    .sort();
+}
+
+function cmdInit(flags) {
+  const p = userConfigPath();
+  if (fs.existsSync(p)) {
+    console.log(`已存在 ${p}，不覆盖。当前配置：`);
+    console.log(fs.readFileSync(p, "utf8"));
+    return;
+  }
+
+  if (!flags.repos) {
+    const candidates = scanCandidateRepos();
+    console.log(`未指定 --repos，尚未写入 ${p}。`);
+    console.log(`~/projects 下候选仓库（${candidates.length} 个）：`);
+    for (const c of candidates) console.log(`  ${c}`);
+    console.log(`确认后重跑: board init --repos ${candidates.length ? candidates.map((c) => path.basename(c)).join(",") : "a,b,c"}`);
+    return;
+  }
+
+  const repos = String(flags.repos)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const output = typeof flags.output === "string" ? flags.output : "~/agent-board/index.html";
+  const cache = typeof flags.cache === "string" ? flags.cache : "~/.cache/board";
+  const config = { on_done: "", workspace: { repos, output, cache } };
+
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(config, null, 2) + "\n", "utf8");
+  console.log(`已写入 ${p}`);
+  console.log(JSON.stringify(config, null, 2));
+}
+
+// --- dispatch ----------------------------------------------------------------
+
+function slugifyBranch(branch) {
+  return branch
+    .toLowerCase()
+    .replace(/\//g, "-")
+    .replace(/[^a-z0-9-]/g, "-");
+}
+
+function detectInstallCommand(boardRoot) {
+  if (fs.existsSync(path.join(boardRoot, "bun.lockb")) || fs.existsSync(path.join(boardRoot, "bun.lock"))) {
+    return "bun install";
+  }
+  return "npm install";
+}
+
+function cmdDispatch(identifier, args) {
+  const boardRoot = resolveBoardRoot();
+  const config = loadOrInitRepoConfig(boardRoot);
+  const tasksDir = store.tasksDirFor(boardRoot);
+
+  let branch = identifier;
+  if (/^T-[0-9a-f]{6}$/.test(identifier)) {
+    const filePath = path.join(tasksDir, `${identifier}.md`);
+    if (!fs.existsSync(filePath)) {
+      console.error(`未找到卡片 ${identifier}`);
+      process.exit(1);
+    }
+    const card = store.readCardFile(filePath);
+    if (!card.data.branch) {
+      console.error(`卡片 ${identifier} 没有 branch（detached），无法 dispatch`);
+      process.exit(1);
+    }
+    branch = card.data.branch;
+  }
+
+  const base = args.base || config.base;
+  const agentName = args.agent || "claude";
+  const agentCmd = (config.agents || {})[agentName] || agentName;
+
+  const localBranches = git.listLocalBranches(boardRoot);
+  const remoteBranches = git.listRemoteBranches(boardRoot);
+  const location = git.resolveBranchLocation(branch, localBranches, remoteBranches);
+  if (!location) {
+    console.log(`分支 ${branch} 不存在，从 ${base} 创建`);
+    git.createBranch(boardRoot, branch, base);
+  }
+
+  const worktreeRoot = git.expandHome(config.worktreeRoot);
+  const repoName = path.basename(boardRoot);
+  const slug = slugifyBranch(branch);
+  const worktreePath = path.join(worktreeRoot, `${repoName}-${slug}`);
+
+  const existingWorktrees = git.listWorktrees(boardRoot);
+  const alreadyExists = existingWorktrees.some((w) => safeRealpath(w.path || "") === safeRealpath(worktreePath));
+
+  if (alreadyExists) {
+    console.log(`复用已有 worktree: ${worktreePath}`);
+  } else {
+    fs.mkdirSync(worktreeRoot, { recursive: true });
+    git.addWorktree(boardRoot, worktreePath, branch);
+    console.log(`已创建 worktree: ${worktreePath}`);
+  }
+
+  for (const file of config.copy || []) {
+    const src = path.join(boardRoot, file);
+    const dest = path.join(worktreePath, file);
+    if (fs.existsSync(src)) {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.copyFileSync(src, dest);
+      console.log(`已拷贝 ${file}`);
+    }
+  }
+
+  const installCmd = detectInstallCommand(boardRoot);
+  console.log(`提示: cd ${worktreePath} && ${installCmd}`);
+  console.log(`cd ${worktreePath}`);
+  console.log(`${agentCmd}`);
+
+  // Ensure a manual card stub exists / agent field set before sync fills derived fields.
+  const id = store.computeId(branch);
+  const filePath = path.join(tasksDir, `${id}.md`);
+  if (fs.existsSync(filePath)) {
+    const card = store.readCardFile(filePath);
+    const data = { ...card.data, agent: args.agent || card.data.agent, updated: nowIso() };
+    store.writeCardFile(tasksDir, id, store.buildCardData(data), card.body);
+  } else {
+    const now = nowIso();
+    const fields = {
+      id,
+      title: branch,
+      branch,
+      next_step: "",
+      evidence: [],
+      agent: args.agent || null,
+      status_pinned: false,
+      status: "backlog",
+      created: now,
+      updated: now,
+      flags: [],
+      keys: [branch],
+    };
+    store.writeCardFile(tasksDir, id, store.buildCardData(fields), "");
+  }
+
+  if (args.run) {
+    spawnSync(agentCmd, { cwd: worktreePath, stdio: "inherit" });
+  }
+
+  const lines = runSync(boardRoot, config, { discover: true, repoLabel: resolveRepoLabel(boardRoot) });
+  for (const l of lines) console.log(l);
+}
+
+// --- sessions ------------------------------------------------------------------
+
+async function cmdSessionsScan() {
+  const boardRoot = resolveBoardRoot();
+  const config = loadRepoConfig(boardRoot);
+  const gitCtx = buildGitCtx(boardRoot, config);
+  if (!gitCtx.prListOk) console.error("WARN gh pr list 失败，PR 链接匹配本轮跳过");
+  const cacheDir = resolveCacheDir();
+  const { totalCount, matchedCount, scannedCount } = await sessionsLib.scanSessions(cacheDir, gitCtx);
+  console.log(`${totalCount} sessions, ${matchedCount} matched to branches（本轮新扫 ${scannedCount} 个文件）`);
+}
+
+// board-spec-v0.2: app session import is repo-agnostic — it always writes to
+// the shared workspace cache, not any single repo's board/.
+function cmdSessionsImport(filePath) {
+  if (!filePath) {
+    console.error("用法: board sessions import <file.json>");
+    process.exit(1);
+  }
+  const cacheDir = resolveCacheDir();
+  const count = sessionsLib.importAppSessions(cacheDir, path.resolve(filePath));
+  console.log(`imported ${count} app sessions`);
+}
+
+// A repo branch a session touched may not have a board card at all — card
+// discovery only carries currently-open worktrees/PRs, not every branch that
+// ever existed (see board-spec-v0 §自动发现). Rather than mislabel those as
+// "无线索" (which per spec means no branch was found at all), derive a
+// lightweight virtual card from the same git/gh facts real cards use, so
+// judgeSession can still answer "敢不敢关" for them. Bounded cost: only
+// computed for the (usually small) set of touched-but-uncarded branches.
+function buildVirtualCard(boardRoot, branch, gitCtx) {
+  const hasLocalBranch = gitCtx.localBranches.includes(branch);
+  const hasOriginBranch = gitCtx.remoteBranches.includes(branch);
+  const prFields = gh.mapPrToFields(gh.pickPrForBranch(gitCtx.prList, branch));
+  let unpushedCommits = 0;
+  if (hasLocalBranch && hasOriginBranch) {
+    unpushedCommits = git.getUnpushedCommitCount(boardRoot, branch) ?? 0;
+  }
+  const stage = deriveStage({ prState: prFields.pr_state, hasLocalBranch, hasOriginBranch, dirtyFiles: 0, unpushedCommits });
+  return {
+    branch,
+    stage,
+    status: stage === "merged" ? "done" : stage === "closed" ? "dropped" : "doing",
+    dirty_files: 0,
+    unpushed_commits: unpushedCommits,
+    pr: prFields.pr,
+    pr_state: prFields.pr_state,
+    conflicts_with: [],
+  };
+}
+
+// `cacheDir`: the shared workspace session cache (see sessions.mjs). Card data
+// (cardsByBranch) is still read from this specific repo's boardRoot.
+function buildSessionListing(boardRoot, cacheDir, gitCtx, { pinnedOnly = false } = {}) {
+  const tasksDir = store.tasksDirFor(boardRoot);
+  const cards = store.readAllCards(tasksDir).map((c) => c.data);
+  const cardsByBranch = new Map();
+  for (const c of cards) {
+    if (c.branch) cardsByBranch.set(c.branch, c);
+  }
+
+  let rows = sessionsLib.buildSessionRows(cacheDir, gitCtx);
+  if (pinnedOnly) rows = rows.filter((r) => r.pinned);
+
+  // Fill in virtual cards for touched branches with no real card, once each.
+  const virtualCache = new Map();
+  for (const r of rows) {
+    for (const b of r.branches) {
+      if (cardsByBranch.has(b) || virtualCache.has(b)) continue;
+      virtualCache.set(b, buildVirtualCard(boardRoot, b, gitCtx));
+    }
+  }
+  const judgeCardsByBranch = new Map([...cardsByBranch, ...virtualCache]);
+
+  rows = rows.map((r) => ({ ...r, judge: sessionsLib.judgeSession(r.branches, judgeCardsByBranch) }));
+  rows.sort((a, b) => new Date(b.lastActive || 0).getTime() - new Date(a.lastActive || 0).getTime());
+  return rows;
+}
+
+const VERDICT_LABEL = { "can-close": "可关", keep: "别关", "no-clue": "无线索" };
+
+// A session's title (first_prompt) is raw human chat text and may contain
+// literal newlines even after the 60-char slice in sessions.mjs — collapse to
+// one line so each row of `sessions ls` output stays one physical line.
+function oneLine(s) {
+  return String(s ?? "").replace(/\s+/g, " ").trim();
+}
+
+// board-spec-v0.2 §CLI: `sessions ls --json` output contract — one flat object
+// per session, safe for an agent to JSON.parse().
+function sessionRowToJson(r) {
+  return {
+    uuid: r.uuid,
+    appSessionId: r.appSessionId ?? null,
+    title: r.title,
+    pinned: !!r.pinned,
+    branches: r.branches,
+    verdict: r.judge.verdict,
+    reason: r.judge.reason,
+    prInferred: !!r.prInferred,
+    lastActive: r.lastActive,
+  };
+}
+
+function printSessionRows(rows, { json = false } = {}) {
+  if (json) {
+    console.log(JSON.stringify(rows.map(sessionRowToJson)));
+    return;
+  }
+  if (rows.length === 0) {
+    console.log("(no sessions)");
+    return;
+  }
+  for (const r of rows) {
+    const id8 = r.uuid.slice(0, 8);
+    const pinnedMark = r.pinned ? "置顶" : "-";
+    const branchesStr = r.branches.length ? r.branches.join(",") : "(无分支线索)";
+    const verdictLabel = VERDICT_LABEL[r.judge.verdict] || r.judge.verdict;
+    const reason = r.judge.reason ? ` — ${oneLine(r.judge.reason)}` : "";
+    const inferredMark = r.prInferred ? "  [按 PR 号推断]" : "";
+    console.log(`${id8}  ${pinnedMark}  ${verdictLabel}${reason}  [${branchesStr}]${inferredMark}  ${oneLine(r.title)}`);
+  }
+}
+
+// Combines the per-repo judgements for the SAME session (a conversation can
+// touch branches in more than one project — board-spec-v0.2 §会话映射多仓化):
+// "keep" wins if any matched repo says keep, otherwise "can-close" once every
+// matched repo agrees; a session matched nowhere stays "no-clue".
+function combineJudges(judges) {
+  if (judges.length === 0) return { verdict: "no-clue", reason: null };
+  const keep = judges.find((j) => j.verdict === "keep");
+  if (keep) return keep;
+  return judges[0];
+}
+
+// Merges buildSessionListing() output across every workspace repo into one
+// row per session uuid, prefixing branches with their repo so the same branch
+// name in two repos doesn't collide.
+function buildWorkspaceSessionRows(repoContexts, cacheDir, { pinnedOnly = false } = {}) {
+  const combined = new Map();
+  for (const rc of repoContexts) {
+    const rows = buildSessionListing(rc.repoRoot, cacheDir, rc.gitCtx, { pinnedOnly });
+    for (const r of rows) {
+      const entry = combined.get(r.uuid) || {
+        uuid: r.uuid,
+        appSessionId: r.appSessionId ?? null,
+        title: r.title,
+        pinned: false,
+        lastActive: null,
+        branches: [],
+        judges: [],
+        prInferred: false,
+      };
+      entry.pinned = entry.pinned || r.pinned;
+      entry.prInferred = entry.prInferred || r.prInferred;
+      if (r.lastActive && (!entry.lastActive || r.lastActive > entry.lastActive)) entry.lastActive = r.lastActive;
+      if (r.branches.length > 0) {
+        for (const b of r.branches) entry.branches.push(`${rc.repoLabel}:${b}`);
+        entry.judges.push(r.judge);
+      }
+      combined.set(r.uuid, entry);
+    }
+  }
+  const out = Array.from(combined.values()).map((e) => ({
+    uuid: e.uuid,
+    appSessionId: e.appSessionId,
+    title: e.title,
+    pinned: e.pinned,
+    lastActive: e.lastActive,
+    branches: e.branches,
+    prInferred: e.prInferred,
+    judge: combineJudges(e.judges),
+  }));
+  out.sort((a, b) => new Date(b.lastActive || 0).getTime() - new Date(a.lastActive || 0).getTime());
+  return out;
+}
+
+function buildRepoContexts() {
+  const contexts = [];
+  forEachWorkspaceRepo((probe) => {
+    const config = loadRepoConfig(probe.repoRoot);
+    const gitCtx = buildGitCtx(probe.repoRoot, config);
+    contexts.push({ ...probe, config, gitCtx });
+  });
+  return contexts;
+}
+
+function cmdSessionsLs(flags) {
+  const cacheDir = resolveCacheDir();
+  const opts = { json: !!flags.json };
+  if (isWorkspaceMode(flags)) {
+    const repoContexts = buildRepoContexts();
+    const rows = buildWorkspaceSessionRows(repoContexts, cacheDir, { pinnedOnly: !!flags.pinned });
+    printSessionRows(rows, opts);
+    return;
+  }
+  const boardRoot = resolveBoardRoot();
+  const config = loadRepoConfig(boardRoot);
+  const gitCtx = buildGitCtx(boardRoot, config);
+  const rows = buildSessionListing(boardRoot, cacheDir, gitCtx, { pinnedOnly: !!flags.pinned });
+  printSessionRows(rows, opts);
+}
+
+// --- render ------------------------------------------------------------------
+
+// Builds one `projects[]` entry per the A/B interface contract (board-spec-v0.2
+// §接口契约), plus `allRows` (every session row, matched or not) which is
+// stripped back out before the object reaches renderBoardHtml — it's only
+// needed here to compute the global noClueSessions list.
+function buildProjectData(repoRoot, repoLabel, cacheDir) {
+  const config = loadRepoConfig(repoRoot);
+  const tasksDir = store.tasksDirFor(repoRoot);
+  const cards = store.readAllCards(tasksDir).map((c) => c.data);
+  const gitCtx = buildGitCtx(repoRoot, config);
+  const allRows = buildSessionListing(repoRoot, cacheDir, gitCtx);
+  const remote = gitCtx.repoOwner && gitCtx.repoName ? `${gitCtx.repoOwner}/${gitCtx.repoName}` : null;
+  return {
+    repoName: repoLabel,
+    remote,
+    repoRoot,
+    cards,
+    sessions: allRows.filter((r) => r.branches.length > 0),
+    allRows,
+  };
+}
+
+// board-spec-v0.2 接口契约: noClueSessions is GLOBAL — an inApp session that
+// matched zero branches in EVERY project, not just this one.
+function computeNoClueSessions(projectsFull) {
+  const matchedUuids = new Set();
+  const latestByUuid = new Map();
+  for (const proj of projectsFull) {
+    for (const r of proj.allRows) {
+      if (r.branches.length > 0) matchedUuids.add(r.uuid);
+      const prev = latestByUuid.get(r.uuid);
+      if (!prev || (r.lastActive && (!prev.lastActive || r.lastActive > prev.lastActive))) {
+        latestByUuid.set(r.uuid, r);
+      }
+    }
+  }
+  return Array.from(latestByUuid.values()).filter((r) => r.inApp && !matchedUuids.has(r.uuid));
+}
+
+function buildSummary(projects) {
+  const pinnedJudgesByUuid = new Map();
+  const allUuids = new Set();
+  for (const proj of projects) {
+    for (const r of proj.sessions) {
+      allUuids.add(r.uuid);
+      if (r.pinned) {
+        const arr = pinnedJudgesByUuid.get(r.uuid) || [];
+        arr.push(r.judge);
+        pinnedJudgesByUuid.set(r.uuid, arr);
+      }
+    }
+  }
+  let pinnedCanClose = 0;
+  for (const judges of pinnedJudgesByUuid.values()) {
+    if (combineJudges(judges).verdict === "can-close") pinnedCanClose++;
+  }
+  const cards = projects.reduce((sum, p) => sum + p.cards.length, 0);
+  return {
+    pinned: pinnedJudgesByUuid.size,
+    pinnedCanClose,
+    repos: projects.length,
+    cards,
+    sessions: allUuids.size,
+  };
+}
+
+function cmdRender(flags) {
+  const cacheDir = resolveCacheDir();
+  const workspaceMode = isWorkspaceMode(flags);
+
+  let repoEntries;
+  if (workspaceMode) {
+    repoEntries = [];
+    forEachWorkspaceRepo((probe) => repoEntries.push(probe));
+  } else {
+    const boardRoot = resolveBoardRoot();
+    repoEntries = [{ repoRoot: boardRoot, repoLabel: resolveRepoLabel(boardRoot) }];
+  }
+
+  const projectsFull = repoEntries.map((e) => buildProjectData(e.repoRoot, e.repoLabel, cacheDir));
+  const noClueSessions = computeNoClueSessions(projectsFull);
+  const projects = projectsFull.map(({ allRows, ...rest }) => rest);
+  const summary = buildSummary(projects);
+  const generatedAt = nowIso();
+
+  let html;
+  try {
+    html = renderBoardHtml({ generatedAt, projects, noClueSessions, summary });
+  } catch (err) {
+    // board-spec-v0.2: render.mjs is being rewritten to this contract in
+    // parallel (implementer B) — fall back to the OLD single-repo signature
+    // so `render`/`sync` don't hard-crash while that lands. B owns render.mjs
+    // and render.test.mjs; this fallback is temporary scaffolding in board.mjs
+    // only, never a change to the contract itself.
+    console.error(`WARN renderBoardHtml 新契约调用失败（render.mjs 可能还没升级到 board-spec-v0.2）：${err.message}`);
+    const p = projects[0] || { cards: [], sessions: [], repoName: "board" };
+    html = renderBoardHtml({
+      cards: p.cards,
+      generatedAt,
+      config: { base: "main" },
+      sessions: p.sessions,
+      repoName: p.repoName,
+    });
+  }
+
+  const { workspace } = loadUserConfig();
+  const outPath = workspaceMode
+    ? path.resolve(git.expandHome((workspace && workspace.output) || "~/agent-workbench/board/index.html"))
+    : path.join(repoEntries[0].repoRoot, "board", "index.html");
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, html, "utf8");
+  console.log(`rendered ${outPath}`);
+}
+
+// --- CLI plumbing --------------------------------------------------------------
+
+function parseFlags(argv) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg.startsWith("--")) {
+      const key = arg.slice(2);
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith("--")) {
+        flags[key] = next;
+        i++;
+      } else {
+        flags[key] = true;
+      }
+    } else {
+      positional.push(arg);
+    }
+  }
+  return { positional, flags };
+}
+
+function printHelp() {
+  console.log(`board — agent-agnostic markdown task board
+
+用法: board <command> [options]
+
+命令（大部分子命令支持 --all 进入工作区模式，遍历 ~/.config/board/config.json 里的 workspace.repos；
+不在任何 git 仓库里跑时自动进入工作区模式）:
+  init [--repos a,b,c] [--output p] [--cache p]   初始化 ~/.config/board/config.json（已存在则只打印不覆盖）
+  sync [--all] [--dry-run] [--no-discover] [--fetch] [--no-sessions]   刷新卡片派生字段（默认顺带增量扫对话）
+  ls [--all] [--status x] [--flag y] [--json]  列出卡片（含 stage、conflicts_with；--all 加仓库列）
+  repos                                        列出 workspace.repos 及各自状态（存在/缺配置/卡片数）
+  add --branch <b> [--title t] [--agent a]     手动建卡（单仓）
+  next <id> "<text>"                           写 next_step
+  evidence <id> "<url|path>"                   追加 evidence
+  pin <id> <status>                            锁定 status
+  unpin <id>                                   解锁 status
+  dispatch <id|branch> [--agent a] [--base b] [--run]   派发 worktree + agent（单仓）
+  sessions scan                                增量扫描 Claude/Codex 转录，匹配到本仓库分支
+  sessions import <file.json>                  导入桌面 app 的 list_sessions 元数据（与仓库无关，写 workspace.cache）
+  sessions ls [--all] [--pinned] [--json]      列出对话：分支、可关/别关/无线索 + 理由
+  render [--all]                               生成 index.html（单仓写 board/index.html；--all 写 workspace.output）
+  archive <id>                                 手动归档卡片
+  --help                                       显示本帮助
+`);
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
+    printHelp();
+    return;
+  }
+
+  const [command, ...rest] = argv;
+
+  try {
+    switch (command) {
+      case "sync": {
+        const { flags } = parseFlags(rest);
+        const cacheDir = resolveCacheDir();
+        const syncOpts = {
+          dryRun: !!flags["dry-run"],
+          discover: !flags["no-discover"],
+          fetch: !!flags.fetch,
+        };
+
+        if (isWorkspaceMode(flags)) {
+          // The transcript scan/cache is shared machine-wide (sessions.mjs
+          // caches raw, repo-agnostic mentions under workspace.cache), so
+          // scanning once per repo below only re-reads unscanned files once
+          // total — each subsequent repo's scanSessions() call is a cheap
+          // cache hit. Doing it per repo (rather than once, separately) keeps
+          // each repo's `sessions: N matched` count meaningful for that repo.
+          forEachWorkspaceRepo((probe) => {
+            console.log(`== ${probe.repoLabel} ==`);
+            const config = loadOrInitRepoConfig(probe.repoRoot);
+            const lines = runSync(probe.repoRoot, config, { ...syncOpts, repoLabel: probe.repoLabel });
+            for (const l of lines) console.log(l);
+          });
+          if (!flags["no-sessions"]) {
+            for (const p of requireWorkspaceRepos()) {
+              const probe = probeConfiguredRepo(p);
+              if (!probe.ok) continue;
+              const config = loadRepoConfig(probe.repoRoot);
+              const gitCtx = buildGitCtx(probe.repoRoot, config);
+              const { totalCount, matchedCount, scannedCount } = await sessionsLib.scanSessions(cacheDir, gitCtx);
+              console.log(
+                `sessions(${probe.repoLabel}): ${totalCount} sessions, ${matchedCount} matched to branches（本轮新扫 ${scannedCount} 个文件）`
+              );
+            }
+          }
+          break;
+        }
+
+        const boardRoot = resolveBoardRoot();
+        const configPathExisted = fs.existsSync(path.join(boardRoot, "board", "board.config.json"));
+        const config = loadOrInitRepoConfig(boardRoot);
+        const lines = runSync(boardRoot, config, { ...syncOpts, repoLabel: resolveRepoLabel(boardRoot) });
+        for (const l of lines) console.log(l);
+        if (!flags["no-sessions"]) {
+          const gitCtx = buildGitCtx(boardRoot, config);
+          if (!gitCtx.prListOk) console.error("WARN gh pr list 失败，PR 链接匹配本轮跳过");
+          const { totalCount, matchedCount, scannedCount } = await sessionsLib.scanSessions(cacheDir, gitCtx);
+          console.log(`sessions: ${totalCount} sessions, ${matchedCount} matched to branches（本轮新扫 ${scannedCount} 个文件）`);
+        }
+        if (!configPathExisted) {
+          console.log("记得把 /board/index.html 加进 .gitignore");
+        }
+        break;
+      }
+      case "ls": {
+        const { flags } = parseFlags(rest);
+        cmdLs(flags);
+        break;
+      }
+      case "repos": {
+        cmdRepos();
+        break;
+      }
+      case "add": {
+        const { flags } = parseFlags(rest);
+        cmdAdd(flags);
+        break;
+      }
+      case "next": {
+        const { positional } = parseFlags(rest);
+        const [id, text] = positional;
+        if (!id || text === undefined) {
+          console.error('用法: board next <id> "<text>"');
+          process.exit(1);
+        }
+        cmdNext(id, text);
+        break;
+      }
+      case "evidence": {
+        const { positional } = parseFlags(rest);
+        const [id, text] = positional;
+        if (!id || text === undefined) {
+          console.error('用法: board evidence <id> "<url|path>"');
+          process.exit(1);
+        }
+        cmdEvidence(id, text);
+        break;
+      }
+      case "pin": {
+        const { positional } = parseFlags(rest);
+        const [id, status] = positional;
+        if (!id || !status) {
+          console.error("用法: board pin <id> <status>");
+          process.exit(1);
+        }
+        cmdPin(id, status);
+        break;
+      }
+      case "unpin": {
+        const { positional } = parseFlags(rest);
+        const [id] = positional;
+        if (!id) {
+          console.error("用法: board unpin <id>");
+          process.exit(1);
+        }
+        cmdUnpin(id);
+        break;
+      }
+      case "dispatch": {
+        const { positional, flags } = parseFlags(rest);
+        const [identifier] = positional;
+        if (!identifier) {
+          console.error("用法: board dispatch <id|branch> [--agent a] [--base b] [--run]");
+          process.exit(1);
+        }
+        cmdDispatch(identifier, flags);
+        break;
+      }
+      case "sessions": {
+        const [subcommand, ...subRest] = rest;
+        const { positional, flags } = parseFlags(subRest);
+        switch (subcommand) {
+          case "scan":
+            await cmdSessionsScan();
+            break;
+          case "import":
+            cmdSessionsImport(positional[0]);
+            break;
+          case "ls":
+            cmdSessionsLs(flags);
+            break;
+          default:
+            console.error("用法: board sessions <scan|import <file.json>|ls [--pinned]>");
+            process.exit(1);
+        }
+        break;
+      }
+      case "render": {
+        const { flags } = parseFlags(rest);
+        cmdRender(flags);
+        break;
+      }
+      case "archive": {
+        const { positional } = parseFlags(rest);
+        const [id] = positional;
+        if (!id) {
+          console.error("用法: board archive <id>");
+          process.exit(1);
+        }
+        cmdArchive(id);
+        break;
+      }
+      case "init": {
+        const { flags } = parseFlags(rest);
+        cmdInit(flags);
+        break;
+      }
+      default:
+        console.error(`未知命令: ${command}`);
+        printHelp();
+        process.exit(1);
+    }
+  } catch (err) {
+    console.error(`board 出错: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+main().catch((err) => {
+  console.error(`board 出错: ${err.message}`);
+  process.exit(1);
+});
