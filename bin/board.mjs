@@ -1106,11 +1106,13 @@ function cmdSessionsLs(flags) {
 // §接口契约), plus `allRows` (every session row, matched or not) which is
 // stripped back out before the object reaches renderBoardHtml — it's only
 // needed here to compute the global noClueSessions list.
-function buildProjectData(repoRoot, repoLabel, cacheDir) {
+function buildProjectData(repoRoot, repoLabel, cacheDir, presetGitCtx = null) {
   const config = loadRepoConfig(repoRoot);
   const tasksDir = store.tasksDirFor(repoRoot);
   const cards = store.readAllCards(tasksDir).map((c) => c.data);
-  const gitCtx = buildGitCtx(repoRoot, config);
+  // 工作区模式下复用带 workspacePrIndex 的 gitCtx，否则 PR 号唯一性规则在 render 里失效，
+  // 顶栏置顶计数会和 sessions ls 对不上
+  const gitCtx = presetGitCtx || buildGitCtx(repoRoot, config);
   const allRows = buildSessionListing(repoRoot, cacheDir, gitCtx);
   const remote = gitCtx.repoOwner && gitCtx.repoName ? `${gitCtx.repoOwner}/${gitCtx.repoName}` : null;
   return {
@@ -1173,17 +1175,18 @@ function cmdRender(flags) {
 
   let repoEntries;
   if (workspaceMode) {
-    repoEntries = [];
-    forEachWorkspaceRepo((probe) => repoEntries.push(probe));
+    repoEntries = buildRepoContexts();
   } else {
     const boardRoot = resolveBoardRoot();
-    repoEntries = [{ repoRoot: boardRoot, repoLabel: resolveRepoLabel(boardRoot) }];
+    repoEntries = [{ repoRoot: boardRoot, repoLabel: resolveRepoLabel(boardRoot), gitCtx: null }];
   }
 
-  const projectsFull = repoEntries.map((e) => buildProjectData(e.repoRoot, e.repoLabel, cacheDir));
+  const projectsFull = repoEntries.map((e) => buildProjectData(e.repoRoot, e.repoLabel, cacheDir, e.gitCtx || null));
   const noClueSessions = computeNoClueSessions(projectsFull);
   const projects = projectsFull.map(({ allRows, ...rest }) => rest);
   const summary = buildSummary(projects);
+  // 顶栏「置顶」口径与 sessions ls --pinned 一致：无线索的置顶对话也算进去
+  summary.pinned += noClueSessions.filter((s) => s.pinned).length;
   const generatedAt = nowIso();
 
   let html;
