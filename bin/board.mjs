@@ -11,6 +11,8 @@ import { deriveStatus, deriveFlags, deriveWorktreeState, deriveStage, deriveConf
 import * as store from "../lib/store.mjs";
 import { renderBoardHtml } from "../lib/render.mjs";
 import * as sessionsLib from "../lib/sessions.mjs";
+import * as hooksLib from "../lib/hooks.mjs";
+import * as mcpLib from "../lib/mcp.mjs";
 
 const DEFAULT_CONFIG = {
   base: "main",
@@ -713,6 +715,222 @@ function cmdArchive(id) {
   console.log(`${id} archived`);
 }
 
+// --- hook / hooks (board-spec-v0.4 §A1) ---------------------------------------
+//
+// `board hook claude` / `board hook codex` are on the hot path of every
+// Claude Code turn (SessionStart/Stop/UserPromptSubmit) — they must NEVER
+// throw, NEVER exit non-zero, and NEVER shell out to `gh`. Every branch below
+// is wrapped so a failure degrades to "recorded nothing" instead of an
+// exception; nothing here calls resolveBoardRoot() (which throws outside a
+// git repo) or gh.mjs.
+
+function readStdinSync() {
+  try {
+    return fs.readFileSync(0, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function cmdHookClaude() {
+  try {
+    const cacheDir = resolveCacheDir();
+    const raw = readStdinSync();
+    hooksLib.recordClaudeHookEvent(cacheDir, raw);
+  } catch {
+    // never let a hook invocation fail the user's Claude Code turn
+  }
+}
+
+function cmdHookCodex(rawArg) {
+  try {
+    const cacheDir = resolveCacheDir();
+    hooksLib.recordCodexHookEvent(cacheDir, rawArg);
+  } catch {
+    // never let a hook invocation fail
+  }
+}
+
+function cmdHooksInstall(flags) {
+  const dryRun = !!flags["dry-run"];
+  const cacheDir = resolveCacheDir();
+
+  console.log("== Claude Code (~/.claude/settings.json) ==");
+  const claudeResult = hooksLib.installClaudeHooks(cacheDir, { dryRun });
+  if (claudeResult.added.length === 0) {
+    console.log(`已装好，无需改动（${claudeResult.path}）`);
+  } else if (dryRun) {
+    console.log(`将在以下事件追加 "${hooksLib.CLAUDE_HOOK_COMMAND}"：${claudeResult.added.join(", ")}`);
+    console.log(`（${claudeResult.path}，写入前会先备份到 ${hooksLib.backupsDir(cacheDir)}）`);
+  } else {
+    console.log(`已在以下事件追加 "${hooksLib.CLAUDE_HOOK_COMMAND}"：${claudeResult.added.join(", ")}`);
+    if (claudeResult.backupPath) console.log(`原文件已备份到 ${claudeResult.backupPath}`);
+  }
+
+  console.log("== Codex (~/.codex/config.toml) ==");
+  const codexResult = hooksLib.installCodexNotify(cacheDir, { dryRun });
+  switch (codexResult.action) {
+    case "skip-already-installed":
+      console.log(`已装好，无需改动：${codexResult.existingLine}`);
+      break;
+    case "manual":
+      console.log(`notify 已被占用，不自动修改：`);
+      console.log(`  现有: ${codexResult.existingLine}`);
+      console.log(`  建议手动改成: ${codexResult.suggestedLine}`);
+      break;
+    case "create":
+      console.log(dryRun ? `将新建 ${codexResult.path} 并写入 notify 行` : `已新建 ${codexResult.path} 并写入 notify 行`);
+      break;
+    case "append":
+      console.log(
+        dryRun
+          ? `将在 ${codexResult.path} 末尾追加 notify 行（写入前会先备份到 ${hooksLib.backupsDir(cacheDir)}）`
+          : `已在 ${codexResult.path} 末尾追加 notify 行${codexResult.backupPath ? `（原文件已备份到 ${codexResult.backupPath}）` : ""}`
+      );
+      break;
+  }
+}
+
+function cmdHooksStatus() {
+  const cacheDir = resolveCacheDir();
+  const status = hooksLib.hooksStatus(cacheDir);
+  console.log("== Claude Code ==");
+  for (const evt of hooksLib.CLAUDE_HOOK_EVENTS) {
+    console.log(`  ${evt}: ${status.claude[evt] ? "已装" : "未装"}`);
+  }
+  console.log("== Codex ==");
+  console.log(`  notify: ${status.codexNotifyInstalled ? "已装" : "未装"}${status.codexNotifyLine ? `（${status.codexNotifyLine}）` : ""}`);
+  console.log("== 事件日志 ==");
+  console.log(`  ${eventsPathLabel(cacheDir)}`);
+  console.log(`  共 ${status.eventCount} 条，最近一条: ${status.lastEventTs || "(无)"}`);
+}
+
+function eventsPathLabel(cacheDir) {
+  return hooksLib.eventsPath(cacheDir);
+}
+
+// --- cleanup / done (board-spec-v0.4 §A2) -------------------------------------
+
+function red(s) {
+  return `\x1b[31m${s}\x1b[0m`;
+}
+
+// Runs the full cleanup sequence for ONE already-vetted candidate card:
+// worktree remove -> branch -d/-D -> worktree prune -> clear worktree fields
+// + append a body line (the only tool-writable line in the human-owned body).
+// Returns a printable summary line; never throws (git.mjs's I/O wrappers
+// already return {ok, error} instead of throwing).
+function cleanupOneCard(boardRoot, repoLabel, card, { apply, force }) {
+  const dirty = card.worktree ? git.getWorktreeDirtyFileCount(card.worktree) : 0;
+  let unpushed = card.branch ? git.getUnpushedCommitCount(boardRoot, card.branch) : null;
+  if (unpushed === null) unpushed = card.unpushed_commits || 0;
+
+  const label = `${card.id}  ${repoLabel}  ${card.branch || "(detached)"}  ${card.worktree}  dirty:${dirty}  unpushed:${unpushed}`;
+
+  const blockers = [];
+  if (!force) {
+    if (dirty > 0) blockers.push(`${dirty} 个未提交文件`);
+    if (unpushed > 0) blockers.push(`${unpushed} 个 commit 未 push`);
+  }
+  if (blockers.length > 0) {
+    console.log(`${label}  ${red("BLOCKED: " + blockers.join("; "))}`);
+    return { ok: false };
+  }
+
+  if (!apply) {
+    console.log(`${label}  (dry-run)`);
+    return { ok: true, dryRun: true };
+  }
+
+  const rm = git.removeWorktree(boardRoot, card.worktree, { force });
+  if (!rm.ok) {
+    console.log(`${label}  ${red("FAILED worktree remove: " + rm.error)}`);
+    return { ok: false };
+  }
+
+  let branchNote = "";
+  if (card.branch) {
+    const br = git.deleteBranch(boardRoot, card.branch, { force });
+    if (!br.ok) {
+      console.log(`${label}  ${red("worktree 已删，但分支删除失败: " + br.error + "（--force 可强删 -D）")}`);
+      return { ok: false };
+    }
+    branchNote = ` 与本地分支 ${card.branch}`;
+  }
+  git.pruneWorktrees(boardRoot);
+
+  const tasksDir = store.tasksDirFor(boardRoot);
+  const dateStr = nowIso().slice(0, 10);
+  const line = `- ${dateStr} cleanup：已删 worktree ${card.worktree}${branchNote}`;
+  const cardFile = store.readCardFile(path.join(tasksDir, `${card.id}.md`));
+  const newBody = store.appendBodyLine(cardFile.body, line);
+  const newData = { ...cardFile.data, worktree: null, worktree_state: null, updated: nowIso() };
+  store.writeCardFile(tasksDir, card.id, store.buildCardData(newData), newBody);
+
+  console.log(`${label}  已清理`);
+  return { ok: true };
+}
+
+function cleanupRepo(boardRoot, repoLabel, { apply, force }) {
+  const tasksDir = store.tasksDirFor(boardRoot);
+  const cards = store.readAllCards(tasksDir).map((c) => c.data);
+  const candidates = cards.filter(store.isCleanupCandidate);
+  for (const card of candidates) {
+    cleanupOneCard(boardRoot, repoLabel, card, { apply, force });
+  }
+  return candidates.length;
+}
+
+function cmdCleanup(flags) {
+  const apply = !!flags.apply;
+  const force = !!flags.force;
+  let total = 0;
+  if (isWorkspaceMode(flags)) {
+    forEachWorkspaceRepo((probe) => {
+      total += cleanupRepo(probe.repoRoot, probe.repoLabel, { apply, force });
+    });
+  } else {
+    const boardRoot = resolveBoardRoot();
+    total = cleanupRepo(boardRoot, resolveRepoLabel(boardRoot), { apply, force });
+  }
+  if (total === 0) console.log("(no cleanup candidates)");
+}
+
+function cmdDone(id, flags) {
+  const force = !!flags.force;
+
+  function tryRepo(boardRoot, repoLabel) {
+    const tasksDir = store.tasksDirFor(boardRoot);
+    const filePath = path.join(tasksDir, `${id}.md`);
+    if (!fs.existsSync(filePath)) return false;
+    const card = store.readCardFile(filePath).data;
+    if (!store.isCleanupCandidate(card)) {
+      console.error(`卡片 ${id} 不满足清理条件（stage 需 merged/closed 或 status=dropped，且要有 branch + worktree）`);
+      process.exit(1);
+    }
+    cleanupOneCard(boardRoot, repoLabel, card, { apply: true, force });
+    return true;
+  }
+
+  if (isWorkspaceMode(flags)) {
+    let found = false;
+    forEachWorkspaceRepo((probe) => {
+      if (!found) found = tryRepo(probe.repoRoot, probe.repoLabel);
+    });
+    if (!found) {
+      console.error(`未找到卡片 ${id}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  const boardRoot = resolveBoardRoot();
+  if (!tryRepo(boardRoot, resolveRepoLabel(boardRoot))) {
+    console.error(`未找到卡片 ${id}`);
+    process.exit(1);
+  }
+}
+
 // --- init ---------------------------------------------------------------------
 
 // Scans ~/projects/* for directories that look like git repos (a `.git` file
@@ -974,6 +1192,7 @@ function sessionRowToJson(r) {
     verdict: r.judge.verdict,
     reason: r.judge.reason,
     prInferred: !!r.prInferred,
+    via: r.via || null,
     lastActive: r.lastActive,
   };
 }
@@ -993,7 +1212,9 @@ function printSessionRows(rows, { json = false } = {}) {
     const branchesStr = r.branches.length ? r.branches.join(",") : "(无分支线索)";
     const verdictLabel = VERDICT_LABEL[r.judge.verdict] || r.judge.verdict;
     const reason = r.judge.reason ? ` — ${oneLine(r.judge.reason)}` : "";
-    const inferredMark = r.prInferred ? "  [按 PR 号推断]" : "";
+    // board-spec-v0.4 §A1: a hook-recorded clue (fact, not inference) outranks
+    // the "按 PR 号推断" label — never show both.
+    const inferredMark = r.via === "hook" ? "  [hook]" : r.prInferred ? "  [按 PR 号推断]" : "";
     console.log(`${id8}  ${pinnedMark}  ${verdictLabel}${reason}  [${branchesStr}]${inferredMark}  ${oneLine(r.title)}`);
   }
 }
@@ -1026,9 +1247,11 @@ function buildWorkspaceSessionRows(repoContexts, cacheDir, { pinnedOnly = false 
         branches: [],
         judges: [],
         prInferred: false,
+        via: null,
       };
       entry.pinned = entry.pinned || r.pinned;
       entry.prInferred = entry.prInferred || r.prInferred;
+      entry.via = entry.via || r.via || null;
       if (r.lastActive && (!entry.lastActive || r.lastActive > entry.lastActive)) entry.lastActive = r.lastActive;
       if (r.branches.length > 0) {
         for (const b of r.branches) entry.branches.push(`${rc.repoLabel}:${b}`);
@@ -1045,6 +1268,7 @@ function buildWorkspaceSessionRows(repoContexts, cacheDir, { pinnedOnly = false 
     lastActive: e.lastActive,
     branches: e.branches,
     prInferred: e.prInferred,
+    via: e.via,
     judge: combineJudges(e.judges),
   }));
   out.sort((a, b) => new Date(b.lastActive || 0).getTime() - new Date(a.lastActive || 0).getTime());
@@ -1263,6 +1487,14 @@ function printHelp() {
   sessions ls [--all] [--pinned] [--json]      列出对话：分支、可关/别关/无线索 + 理由
   render [--all]                               生成 index.html（单仓写 board/index.html；--all 写 workspace.output）
   archive <id>                                 手动归档卡片
+  hook claude                                  内部命令：Claude Code hook 用（stdin 读 JSON），供 settings.json 调用
+  hook codex <json>                            内部命令：Codex notify 用，供 config.toml 调用
+  hooks install [--dry-run]                    把 hook 直写接进 Claude Code / Codex（写前自动备份）
+  hooks status                                 查看两边是否装好、事件日志条数与最近一条时间
+  cleanup [--all] [--apply] [--force]          清理 merged/closed/dropped 且带 worktree 的卡（默认 dry-run）
+  done <id> [--force]                          等价于对单张卡跑 cleanup --apply
+  mcp                                          启动 stdio 上的 MCP server
+  mcp install [--dry-run]                      注册到 Claude Code / Codex 的 MCP 配置
   --help                                       显示本帮助
 `);
 }
@@ -1432,6 +1664,60 @@ async function main() {
       case "init": {
         const { flags } = parseFlags(rest);
         cmdInit(flags);
+        break;
+      }
+      case "hook": {
+        // board-spec-v0.4 §A1: this command must never throw or exit
+        // non-zero — a bad/missing subcommand is a silent no-op, not an
+        // error, so a misconfigured hook never fails the caller's turn.
+        const [sub, ...subRest] = rest;
+        if (sub === "claude") {
+          cmdHookClaude();
+        } else if (sub === "codex") {
+          const rawArg = subRest.length > 0 ? subRest[subRest.length - 1] : "";
+          cmdHookCodex(rawArg);
+        }
+        break;
+      }
+      case "hooks": {
+        const [sub, ...subRest] = rest;
+        const { flags } = parseFlags(subRest);
+        if (sub === "install") {
+          cmdHooksInstall(flags);
+        } else if (sub === "status") {
+          cmdHooksStatus();
+        } else {
+          console.error("用法: board hooks <install [--dry-run]|status>");
+          process.exit(1);
+        }
+        break;
+      }
+      case "cleanup": {
+        const { flags } = parseFlags(rest);
+        cmdCleanup(flags);
+        break;
+      }
+      case "done": {
+        const { positional, flags } = parseFlags(rest);
+        const [id] = positional;
+        if (!id) {
+          console.error("用法: board done <id> [--force]");
+          process.exit(1);
+        }
+        cmdDone(id, flags);
+        break;
+      }
+      case "mcp": {
+        const [sub, ...subRest] = rest;
+        if (!sub) {
+          await mcpLib.runServer();
+        } else if (sub === "install") {
+          const { flags } = parseFlags(subRest);
+          mcpLib.installMcp({ dryRun: !!flags["dry-run"] });
+        } else {
+          console.error(`未知子命令: mcp ${sub}`);
+          process.exit(1);
+        }
         break;
       }
       default:

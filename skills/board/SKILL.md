@@ -16,6 +16,13 @@ description: 跨仓库任务板：对话 → 分支 → 落地。用户问某个
 3. **开始一段分支工作**：`board dispatch <branch> --agent <你是谁>` 建 worktree 并落卡，然后 `board next <id> "<这轮要做到什么>"`。已有卡就只写 next。
 4. **结束一段工作**：`board evidence <id> <PR链接|截图路径|测试输出路径>`，再 `board next <id>` 写下一步或「等卡尔过目」，最后 `board sync`。没有 evidence 的 done 卡不亮绿。
 5. **给人看**：`board render --all`，用 headless Chrome 截 `~/agent-workbench/board/index.html` 发给用户。
+6. **合并后的收尾**：`board cleanup --all` 列出已合并却还留着 worktree 的卡；用户点头后 `board cleanup --all --apply` 删 worktree 和本地分支，有脏文件或未 push 的会被拒绝，别用 `--force` 绕过，把拒绝原因告诉用户。
+
+## 三条进门的路
+
+- **CLI**：本文所有命令。
+- **hooks**：`board hooks install` 装一次后，Claude Code 每次会话开始、每条用户消息、每次结束都会把 (session, cwd, 当前分支) 记进 `~/.cache/board/hooks/events.jsonl`，对话↔分支不用再猜。`sessions ls` 里带 `hook` 标签的行就是这条路来的，置信度最高。`board hooks status` 看装没装。
+- **MCP**：`board mcp install` 后，Claude Code 和 Codex 都能用 `board_ls`、`board_sessions`、`board_next`、`board_evidence`、`board_pin`、`board_cleanup`、`board_dispatch` 这些工具直接读写卡片，效果与 CLI 一致。有 MCP 就优先用工具，少开 shell。
 
 ## 关对话的流程
 

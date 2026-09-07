@@ -1,6 +1,6 @@
 {
   "name": "agent-board",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "Agent-agnostic markdown task board CLI for multi-repo, multi-agent workflows.",
   "type": "module",
   "bin": {
