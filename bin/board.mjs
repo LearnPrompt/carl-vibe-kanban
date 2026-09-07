@@ -968,7 +968,7 @@ function cmdInit(flags) {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  const output = typeof flags.output === "string" ? flags.output : "~/agent-board/index.html";
+  const output = typeof flags.output === "string" ? flags.output : "~/.cache/board/index.html";
   const cache = typeof flags.cache === "string" ? flags.cache : "~/.cache/board";
   const config = { on_done: "", workspace: { repos, output, cache } };
 

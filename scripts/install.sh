@@ -13,7 +13,7 @@ cd "$REPO_DIR"
 chmod +x "$REPO_DIR/bin/board.mjs"
 
 echo "== linking board CLI =="
-if npm link >/tmp/agent-board-install-npmlink.log 2>&1; then
+if npm link >/tmp/carl-vibe-kanban-install-npmlink.log 2>&1; then
   echo "npm link OK"
 else
   echo "npm link failed, falling back to ~/.npm-global/bin symlink"
