@@ -18,9 +18,9 @@ vibe-kanban 把看板放在自己的数据库里，手动 checkout 它不认，�
 
 vibe-kanban 替你起 agent 进程，每家 CLI 改一次输出格式就要适配一次（三十多条适配 issue）。这里不起进程，任何能读写文件的 agent 第一天就能用。
 
-vibe-kanban 从 v0.1.9 起要登录才能看板（#2687）。这里是仓库里的一个 `board/` 文件夹，离线、内网、多机同步都靠 git。
+vibe-kanban 从 0.1.9 起要登录已停运的云端才能看板（#2687，三十三票反对）。这里是仓库里的一个 `board/` 文件夹，离线、内网、多机同步都靠 git。
 
-它的现状：Bloop 于 2026 年 4 月关停，云端 5 月 10 日下线，官网域名 6 月过期，最后一个能本地跑完整看板的版本是 `npx vibe-kanban@0.1.43`。本项目不是它的 fork，没有共用代码，名字里带 vibe-kanban 是为了让找它替代品的人能找到这里。
+它的现状：Bloop 于 2026 年 4 月关停，云端 5 月 10 日下线，官网域名 6 月过期。看板从 0.1.9 起就搬到了云端（#2687），之后的版本不登录只能建 workspace；最后一个本地存看板、不用登录的版本是 `npx vibe-kanban@0.1.8`，0.1.43 只在自托管服务端加本地账号的路线下还保留 projects。本项目不是它的 fork，没有共用代码，名字里带 vibe-kanban 是为了让找它替代品的人能找到这里。
 
 ### 从 vibe-kanban 导入
 
@@ -42,7 +42,7 @@ board import vibe-kanban ~/path/db.v2.sqlite --repo ~/projects/foo --apply   # �
 
 按 `vk:<task_id>` 作自然键，重复导入幂等：已存在的卡片只更新正文里的导入行，不覆盖你手改过的字段。导入后建议跑一次 `board sync` 把 `repo`/`pr`/`stage` 等派生字段补全。
 
-Coming from vibe-kanban: a project is a repo here, a task is a markdown card, a workspace/attempt is a branch plus a worktree, and attempt status is the card's derived fields and evidence lines. Three differences, each matching a recurring issue there: no database, so the board cannot drift from git (#2655, #2629, #3329); no agent runner, so nothing to adapt per CLI; no login, the board is a folder in your repo. Bloop shut down in April 2026, cloud went dark May 10, the domain expired in June; the last fully local version is `npx vibe-kanban@0.1.43`. This is not a fork and shares no code.
+Coming from vibe-kanban: a project is a repo here, a task is a markdown card, a workspace/attempt is a branch plus a worktree, and attempt status is the card's derived fields and evidence lines. Three differences, each matching a recurring issue there: no database, so the board cannot drift from git (#2655, #2629, #3329); no agent runner, so nothing to adapt per CLI; no login, the board is a folder in your repo. Bloop shut down in April 2026, cloud went dark May 10, the domain expired in June. The board moved to the cloud in 0.1.9 (#2687); later versions only create workspaces offline. The last release with a local, no-login board is `npx vibe-kanban@0.1.8`; 0.1.43 keeps projects only if you self-host the server with local auth. This is not a fork and shares no code.
 
 ### Importing from vibe-kanban
 
