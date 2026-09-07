@@ -22,7 +22,47 @@ vibe-kanban 从 v0.1.9 起要登录才能看板（#2687）。这里是仓库里�
 
 它的现状：Bloop 于 2026 年 4 月关停，云端 5 月 10 日下线，官网域名 6 月过期，最后一个能本地跑完整看板的版本是 `npx vibe-kanban@0.1.43`。本项目不是它的 fork，没有共用代码，名字里带 vibe-kanban 是为了让找它替代品的人能找到这里。
 
+### 从 vibe-kanban 导入
+
+```bash
+board import vibe-kanban                        # 默认数据库路径，dry-run 预览要导入什么
+board import vibe-kanban --apply                 # 实际写卡片
+board import vibe-kanban ~/path/db.v2.sqlite --repo ~/projects/foo --apply   # 指定数据库和目标仓库
+```
+
+默认数据库路径：macOS `~/Library/Application Support/ai.bloop.vibe-kanban/db.v2.sqlite`；Linux 一般是 `~/.local/share/vibe-kanban/db.v2.sqlite`（尊重 `$XDG_DATA_HOME`）。也支持 `.json`（vibe-kanban 官方目前没有面向本地库的导出格式，这是 board 自己的归一化格式，见 `lib/import-vibe-kanban.mjs` 顶部注释）。
+
+| vibe-kanban | board |
+|---|---|
+| project（按 git 仓库路径匹配 `workspace.repos`，匹配不到用 `--repo` 指定） | repo |
+| task（title / description / status） | 卡片（title / body / status），`status_pinned: true` |
+| todo / inprogress / inreview / done / cancelled | backlog / doing / review / done / dropped |
+| 最新 attempt/workspace 的 branch（没有分支的 task 默认跳过，加 `--branchless` 一并导入） | `branch` |
+| 关联的 PR（`pull_requests` 表） | `evidence` 里追加一行 `PR #n <url> (<status>)` |
+
+按 `vk:<task_id>` 作自然键，重复导入幂等：已存在的卡片只更新正文里的导入行，不覆盖你手改过的字段。导入后建议跑一次 `board sync` 把 `repo`/`pr`/`stage` 等派生字段补全。
+
 Coming from vibe-kanban: a project is a repo here, a task is a markdown card, a workspace/attempt is a branch plus a worktree, and attempt status is the card's derived fields and evidence lines. Three differences, each matching a recurring issue there: no database, so the board cannot drift from git (#2655, #2629, #3329); no agent runner, so nothing to adapt per CLI; no login, the board is a folder in your repo. Bloop shut down in April 2026, cloud went dark May 10, the domain expired in June; the last fully local version is `npx vibe-kanban@0.1.43`. This is not a fork and shares no code.
+
+### Importing from vibe-kanban
+
+```bash
+board import vibe-kanban                        # default db path, dry-run preview
+board import vibe-kanban --apply                 # actually write cards
+board import vibe-kanban ~/path/db.v2.sqlite --repo ~/projects/foo --apply   # explicit db + target repo
+```
+
+Default database path: macOS `~/Library/Application Support/ai.bloop.vibe-kanban/db.v2.sqlite`; Linux is usually `~/.local/share/vibe-kanban/db.v2.sqlite` (honors `$XDG_DATA_HOME`). `.json` is also accepted (vibe-kanban has no official export format for the local database as of this writing — this is board's own normalized shape, documented at the top of `lib/import-vibe-kanban.mjs`).
+
+| vibe-kanban | board |
+|---|---|
+| project (matched to `workspace.repos` by git repo path; use `--repo` when it doesn't match) | repo |
+| task (title / description / status) | card (title / body / status), `status_pinned: true` |
+| todo / inprogress / inreview / done / cancelled | backlog / doing / review / done / dropped |
+| branch of the task's latest attempt/workspace (branchless tasks are skipped by default; `--branchless` imports them too) | `branch` |
+| linked PR (`pull_requests` table) | an `evidence` line: `PR #n <url> (<status>)` |
+
+Keyed by `vk:<task_id>`, so re-importing is idempotent: an existing card only gets its import line refreshed, never its hand-edited fields. Run `board sync` afterward to fill in `repo`/`pr`/`stage` and the rest of the derived fields.
 
 ## 中文
 

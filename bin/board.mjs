@@ -13,6 +13,7 @@ import { renderBoardHtml } from "../lib/render.mjs";
 import * as sessionsLib from "../lib/sessions.mjs";
 import * as hooksLib from "../lib/hooks.mjs";
 import * as mcpLib from "../lib/mcp.mjs";
+import * as importVkLib from "../lib/import-vibe-kanban.mjs";
 
 const DEFAULT_CONFIG = {
   base: "main",
@@ -1324,6 +1325,98 @@ function cmdSessionsLs(flags) {
   printSessionRows(rows, opts);
 }
 
+// --- import vibe-kanban ---------------------------------------------------------
+
+// Candidate repos a VK project's repo path(s) can resolve against: every
+// configured workspace.repos entry, plus (when board is run from inside a
+// specific repo) that repo itself — so `board import vibe-kanban` works both
+// in a bare single-repo checkout with no ~/.config/board/config.json at all,
+// and across a whole workspace in one shot.
+function buildImportCandidateRepos() {
+  const candidates = [];
+  const { workspace } = loadUserConfig();
+  if (workspace && Array.isArray(workspace.repos)) {
+    for (const p of workspace.repos) {
+      const probe = probeConfiguredRepo(p);
+      if (probe.ok) candidates.push({ repoRoot: probe.repoRoot, repoLabel: probe.repoLabel });
+    }
+  }
+  try {
+    const boardRoot = resolveBoardRoot();
+    candidates.push({ repoRoot: boardRoot, repoLabel: resolveRepoLabel(boardRoot) });
+  } catch {
+    // not inside a git repo (or BOARD_HOME unset) — workspace.repos is all we have
+  }
+  return candidates;
+}
+
+async function cmdImportVibeKanban(sourceArg, flags) {
+  const sourcePath = sourceArg ? path.resolve(git.expandHome(sourceArg)) : importVkLib.defaultDbPath();
+
+  let repoOverride = null;
+  if (flags.repo) {
+    const probe = probeConfiguredRepo(flags.repo);
+    if (!probe.ok) {
+      console.error(`--repo ${flags.repo} 无效: ${probe.reason}`);
+      process.exit(1);
+    }
+    repoOverride = { repoRoot: probe.repoRoot, repoLabel: probe.repoLabel };
+  }
+
+  const candidateRepos = buildImportCandidateRepos();
+  const resolveRepo = (project) => importVkLib.resolveProjectRepo(project, { candidateRepos, repoOverride });
+
+  const data = await importVkLib.loadVibeKanbanData(sourcePath);
+
+  // Pre-resolve every distinct repo so we can read its existing cards once
+  // (planImport needs that to decide new vs. updated vs. unchanged).
+  const existingCardsByRepo = new Map();
+  for (const project of data.projects) {
+    const repo = resolveRepo(project);
+    if (repo && !existingCardsByRepo.has(repo.repoRoot)) {
+      existingCardsByRepo.set(repo.repoRoot, store.readAllCards(store.tasksDirFor(repo.repoRoot)));
+    }
+  }
+
+  const perRepo = importVkLib.planImport(data, {
+    resolveRepo,
+    branchless: !!flags.branchless,
+    existingCardsByRepo,
+  });
+
+  console.log(`source: ${sourcePath}`);
+  for (const line of importVkLib.summarizePlan(perRepo)) console.log(line);
+
+  const unresolved = perRepo.find((b) => b.repoRoot === null);
+  if (unresolved && unresolved.entries.length > 0) {
+    console.error("");
+    console.error("以下 vibe-kanban project 匹配不到本地仓库（未配置 workspace.repos，也没传 --repo）：");
+    for (const name of unresolved.projectNames) console.error(`  - ${name}`);
+    console.error("用 --repo <path> 指定，或把对应仓库加进 ~/.config/board/config.json 的 workspace.repos");
+  }
+
+  if (!flags.apply) {
+    console.log("");
+    console.log("(dry-run，加 --apply 才写入；无分支的 task 默认跳过，加 --branchless 一并导入)");
+    return;
+  }
+
+  if (unresolved && unresolved.entries.length > 0) {
+    console.error("有未匹配到仓库的 project，先解决后再 --apply");
+    process.exit(1);
+  }
+
+  for (const bucket of perRepo) {
+    if (!bucket.repoRoot) continue;
+    const { created, updated, unchanged } = importVkLib.applyRepoPlan(bucket.repoRoot, bucket.entries);
+    const skippedBranchless = bucket.entries.filter((e) => e.outcome === "skip-no-branch").length;
+    console.log(
+      `${bucket.repoLabel}  created ${created}  updated ${updated}  unchanged ${unchanged}  跳过无分支 ${skippedBranchless}`
+    );
+  }
+  console.log("建议接着跑 board sync 补全派生字段（repo/pr/stage 等）");
+}
+
 // --- render ------------------------------------------------------------------
 
 // Builds one `projects[]` entry per the A/B interface contract (board-spec-v0.2
@@ -1485,6 +1578,9 @@ function printHelp() {
   sessions scan                                增量扫描 Claude/Codex 转录，匹配到本仓库分支
   sessions import <file.json>                  导入桌面 app 的 list_sessions 元数据（与仓库无关，写 workspace.cache）
   sessions ls [--all] [--pinned] [--json]      列出对话：分支、可关/别关/无线索 + 理由
+  import vibe-kanban [path] [--repo p] [--branchless] [--apply]
+                                                导入 vibe-kanban 本地任务为卡片（默认 dry-run，--apply 才写；
+                                                path 缺省时用 vibe-kanban 默认数据库路径，见 README）
   render [--all]                               生成 index.html（单仓写 board/index.html；--all 写 workspace.output）
   archive <id>                                 手动归档卡片
   hook claude                                  内部命令：Claude Code hook 用（stdin 读 JSON），供 settings.json 调用
@@ -1643,6 +1739,17 @@ async function main() {
           default:
             console.error("用法: board sessions <scan|import <file.json>|ls [--pinned]>");
             process.exit(1);
+        }
+        break;
+      }
+      case "import": {
+        const [subcommand, ...subRest] = rest;
+        const { positional, flags } = parseFlags(subRest);
+        if (subcommand === "vibe-kanban") {
+          await cmdImportVibeKanban(positional[0], flags);
+        } else {
+          console.error("用法: board import vibe-kanban [path] [--repo p] [--branchless] [--apply]");
+          process.exit(1);
         }
         break;
       }
