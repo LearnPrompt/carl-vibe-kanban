@@ -20,7 +20,6 @@ const DEFAULT_CONFIG = {
   discover: ["worktrees", "prs"],
   staleDays: 7,
   archiveDays: 14,
-  aliases: [],
   agents: { claude: "claude", codex: "codex" },
 };
 
@@ -47,26 +46,27 @@ function resolveRealMainWorktreeRoot(boardRoot) {
 
 function loadRepoConfig(boardRoot) {
   const configPath = path.join(boardRoot, "board", "board.config.json");
-  if (!fs.existsSync(configPath)) return { ...DEFAULT_CONFIG };
-  try {
-    const raw = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    return { ...DEFAULT_CONFIG, ...raw };
-  } catch (err) {
-    console.error(`WARN 读取 board.config.json 失败，使用默认配置: ${err.message}`);
-    return { ...DEFAULT_CONFIG };
+  let cfg = { ...DEFAULT_CONFIG };
+  if (fs.existsSync(configPath)) {
+    try {
+      cfg = { ...DEFAULT_CONFIG, ...JSON.parse(fs.readFileSync(configPath, "utf8")) };
+    } catch (err) {
+      console.error(`WARN 读取 board.config.json 失败，使用默认配置: ${err.message}`);
+    }
   }
+  // base 写死 main 会在 master 仓里报 malformed object name；按实际主干修正
+  cfg.base = git.detectDefaultBranch(boardRoot, cfg.base);
+  return cfg;
 }
 
 // board-spec-v0.2 §模式判定: a repo with no board/board.config.json yet gets one
-// auto-created on its first `sync`, seeded with an alias derived from its own
-// directory name (lowercased) so app-title matching (sessions.mjs
-// appTitleMatchesAlias) works out of the box. Read-only commands (ls, sessions
-// ls, render) use plain loadRepoConfig() above and never write this file.
+// auto-created on its first `sync`, seeded with DEFAULT_CONFIG. Read-only
+// commands (ls, sessions ls, render) use plain loadRepoConfig() above and
+// never write this file.
 function loadOrInitRepoConfig(boardRoot) {
   const configPath = path.join(boardRoot, "board", "board.config.json");
   if (fs.existsSync(configPath)) return loadRepoConfig(boardRoot);
-  const alias = path.basename(boardRoot).toLowerCase();
-  const cfg = { ...DEFAULT_CONFIG, aliases: [alias] };
+  const cfg = { ...DEFAULT_CONFIG, base: git.detectDefaultBranch(boardRoot, DEFAULT_CONFIG.base) };
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
   fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n", "utf8");
   return cfg;
@@ -174,10 +174,14 @@ function safeRealpath(p) {
 // Shared git/gh facts used by both card sync and session scanning/matching
 // (board-spec-v0.1). `prList` here always resolves to an array (never null)
 // so session matching degrades gracefully when `gh` is unavailable.
-// `config.aliases` (board.config.json) rides along here because it's a
-// repo-identity fact just like repoOwner/repoName — it's how sessions.mjs's
-// prNumber fallback recognizes "this repo" for app-only rows with no
-// transcript (board-spec-v0.1 §prNumber 兜底加仓库守卫 guard b).
+// `repoRoot` + `repoLabel` ride along here because sessions.mjs's cwd-based
+// ownership resolution (resolveCwdOwnership) needs repoRoot/worktreeEntries
+// to decide whether a session's cwd belongs to this repo, and the prNumber
+// fallback's PR-uniqueness path needs repoLabel to match itself up against
+// gitCtx.workspacePrIndex (set separately, workspace-mode only — see
+// buildRepoContexts below). `config` is accepted for parity with call sites
+// that pass it, but no longer contributes anything here (aliases removed —
+// title/alias matching is gone, cwd/branch are now the only signals).
 function buildGitCtx(boardRoot, config) {
   const localBranches = git.listLocalBranches(boardRoot);
   const remoteBranches = git.listRemoteBranches(boardRoot);
@@ -186,6 +190,8 @@ function buildGitCtx(boardRoot, config) {
   const originUrl = git.getOriginUrl(boardRoot);
   const parsedRemote = git.parseGithubRemote(originUrl) || {};
   return {
+    repoRoot: path.resolve(boardRoot),
+    repoLabel: parsedRemote.repo || path.basename(boardRoot),
     localBranches,
     remoteBranches,
     worktreeEntries,
@@ -193,7 +199,6 @@ function buildGitCtx(boardRoot, config) {
     prListOk: prList !== null,
     repoOwner: parsedRemote.owner || null,
     repoName: parsedRemote.repo || null,
-    aliases: (config && config.aliases) || [],
   };
 }
 
@@ -273,6 +278,7 @@ function runSync(boardRoot, config, opts = {}) {
   }
 
   if (discoverList.includes("prs") && prListResult) {
+    // 只给还开着的 PR 自动建卡；已合并/已关的历史 PR 不进板，免得把几十条旧账灌成噪音
     for (const pr of prListResult) {
       if (pr.state !== "OPEN") continue;
       considerNewCard(pr.headRefName, { title: pr.title, branch: pr.headRefName });
@@ -1045,6 +1051,27 @@ function buildWorkspaceSessionRows(repoContexts, cacheDir, { pinnedOnly = false 
   return out;
 }
 
+// board-spec §prNumber 兜底路径 (iii), workspace mode only: a session's PR
+// number that's unique to exactly one repo's OPEN PRs across the whole
+// workspace can be trusted as an attribution signal even with no cwd or
+// transcript clue (flagged `prInferred` — see mergeSessionRow). Built here,
+// after every repo's gitCtx.prList is known, then shared onto every repo's
+// gitCtx so mergeSessionRow can consult it per repo. Single-repo mode never
+// calls this, so gitCtx.workspacePrIndex stays undefined there and path
+// (iii) is simply unavailable (no fabricated single-entry index).
+// 全部状态的 PR 都进索引：已合并 PR 正是判「可关」最常用的线索；
+// 唯一性靠「这个号只在一个仓出现」保证，不靠 state。
+function buildWorkspacePrIndex(contexts) {
+  const index = new Map();
+  for (const ctx of contexts) {
+    for (const pr of ctx.gitCtx.prList || []) {
+      if (!index.has(pr.number)) index.set(pr.number, new Set());
+      index.get(pr.number).add(ctx.gitCtx.repoLabel);
+    }
+  }
+  return index;
+}
+
 function buildRepoContexts() {
   const contexts = [];
   forEachWorkspaceRepo((probe) => {
@@ -1052,6 +1079,8 @@ function buildRepoContexts() {
     const gitCtx = buildGitCtx(probe.repoRoot, config);
     contexts.push({ ...probe, config, gitCtx });
   });
+  const workspacePrIndex = buildWorkspacePrIndex(contexts);
+  for (const ctx of contexts) ctx.gitCtx.workspacePrIndex = workspacePrIndex;
   return contexts;
 }
 
