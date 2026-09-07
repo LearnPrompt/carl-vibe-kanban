@@ -25,7 +25,7 @@ board sessions ls --all --pinned     # 列出置顶对话：分支、可关/别�
 | `id` / `branch` / `created` | 派生 | 卡片标识，创建时写入不再变 |
 | `status` / `stage` / `pr` / `pr_state` | 派生 | 由 git/gh 事实推导，`sync` 时重算 |
 | `flags` / `conflicts_with` | 派生 | 脏文件、未 push、与其他卡片冲突等信号 |
-| `agent` | 派生 | dispatch 时记录派给了哪个 agent |
+| `agent` | 人工 | 派给了哪个 agent，dispatch --agent 写入，也可手改 |
 | `title` | 人工 | 卡片标题 |
 | `next_step` | 人工 | 下一步该做什么，`board next` 写 |
 | `evidence` | 人工 | 验证证据（链接或路径），`board evidence` 追加 |
