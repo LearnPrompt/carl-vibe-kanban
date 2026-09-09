@@ -11,7 +11,7 @@ description: 跨仓库任务板：对话 → 分支 → 落地。用户问某个
 
 ## 何时跑什么
 
-1. **回答进度或"哪些对话能关"之前**：`board sync --all` 再 `board sessions ls --all --pinned --json`。用刷出来的字段作答，不引用记忆里的 PR 状态。
+1. **回答进度或"哪些对话能关"之前**：`board sync --all` 再 `board sessions ls --all --pinned --json`。用刷出来的字段作答，不引用记忆里的 PR 状态。关对话之前可先跑 `board sessions judge --all --ai` 拿 AI 建议，结果只是建议，归档仍等用户点头。
 2. **对话元数据只有桌面 app 有**：在 Claude 桌面 app 里时，先用 `list_sessions` 拿会话列表（limit 100），写成 JSON 文件，`board sessions import <文件>`。不导入就没有标题、置顶、PR 号，树上只剩转录抽出来的第一句话。
 3. **开始一段分支工作**：`board dispatch <branch> --agent <你是谁>` 建 worktree 并落卡，然后 `board next <id> "<这轮要做到什么>"`。已有卡就只写 next。
 4. **结束一段工作**：`board evidence <id> <PR链接|截图路径|测试输出路径>`，再 `board next <id>` 写下一步或「等卡尔过目」，最后 `board sync`。没有 evidence 的 done 卡不亮绿。
@@ -22,7 +22,7 @@ description: 跨仓库任务板：对话 → 分支 → 落地。用户问某个
 
 - **CLI**：本文所有命令。
 - **hooks**：`board hooks install` 装一次后，Claude Code 每次会话开始、每条用户消息、每次结束都会把 (session, cwd, 当前分支) 记进 `~/.cache/board/hooks/events.jsonl`，对话↔分支不用再猜。`sessions ls` 里带 `hook` 标签的行就是这条路来的，置信度最高。`board hooks status` 看装没装。
-- **MCP**：`board mcp install` 后，Claude Code 和 Codex 都能用 `board_ls`、`board_sessions`、`board_next`、`board_evidence`、`board_pin`、`board_cleanup`、`board_dispatch` 这些工具直接读写卡片，效果与 CLI 一致。有 MCP 就优先用工具，少开 shell。
+- **MCP**：`board mcp install` 后，Claude Code 和 Codex 都能用 `board_ls`、`board_sessions`、`board_judge`、`board_next`、`board_evidence`、`board_pin`、`board_cleanup`、`board_dispatch` 这些工具直接读写卡片，效果与 CLI 一致。有 MCP 就优先用工具，少开 shell。
 
 ## 关对话的流程
 
@@ -34,6 +34,8 @@ description: 跨仓库任务板：对话 → 分支 → 落地。用户问某个
 3. `keep` 的把 reason 原话告诉用户，让用户决定推进还是放弃；放弃就 `board pin <id> dropped`。
 
 Codex 里没有 app 的会话工具，只做第 1 步给清单。
+
+页面这条路：`board render --all` 生成的页里每个仓库上方有「建议归档」面板（只列有 appSessionId 的会话，转录行折在下面），用户勾选后点「让 Claude 归档」，桌面 app 会用 `claude://code/new?prompt=…` 新开一个会话并把清单塞进首条消息。你若在那个会话里醒来，看到「请用 archive_session 逐个归档以下桌面会话」就按清单逐个调 `archive_session`（reason 写「分支已合并」），置顶的报出来让用户取消置顶，清单之外的一个都别动。chip 上的「打开」是 `claude://code/continue?session=<local_id>`，直接跳到那个会话；Codex 会话暂无跳转。
 
 ## 读 sync 输出
 

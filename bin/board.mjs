@@ -1146,7 +1146,7 @@ function buildVirtualCard(boardRoot, branch, gitCtx) {
 
 // `cacheDir`: the shared workspace session cache (see sessions.mjs). Card data
 // (cardsByBranch) is still read from this specific repo's boardRoot.
-function buildSessionListing(boardRoot, cacheDir, gitCtx, { pinnedOnly = false } = {}) {
+function buildSessionListing(boardRoot, cacheDir, gitCtx, { pinnedOnly = false, staleDays = 14 } = {}) {
   const tasksDir = store.tasksDirFor(boardRoot);
   const cards = store.readAllCards(tasksDir).map((c) => c.data);
   const cardsByBranch = new Map();
@@ -1169,6 +1169,19 @@ function buildSessionListing(boardRoot, cacheDir, gitCtx, { pinnedOnly = false }
 
   rows = rows.map((r) => ({ ...r, judge: sessionsLib.judgeSession(r.branches, judgeCardsByBranch) }));
   rows.sort((a, b) => new Date(b.lastActive || 0).getTime() - new Date(a.lastActive || 0).getTime());
+  attachSuggestions(rows, cacheDir, staleDays);
+  return rows;
+}
+
+// Mutates `rows` in place, adding `.suggest` (rule layer always, plus any
+// still-valid cached AI verdict from a previous `judge --ai` run) — shared by
+// `sessions ls`, `render`, and the combined workspace view below, so a
+// suggestion computed once shows up everywhere a session row does.
+function attachSuggestions(rows, cacheDir, staleDays = 14) {
+  const suggestMap = sessionsLib.suggestArchive(rows, { now: Date.now(), staleDays });
+  const judgeCache = sessionsLib.loadJudgeCache(cacheDir);
+  sessionsLib.applyJudgeCache(rows, suggestMap, judgeCache);
+  for (const r of rows) r.suggest = suggestMap.get(r.uuid) || null;
   return rows;
 }
 
@@ -1195,6 +1208,7 @@ function sessionRowToJson(r) {
     prInferred: !!r.prInferred,
     via: r.via || null,
     lastActive: r.lastActive,
+    suggest: r.suggest || null,
   };
 }
 
@@ -1216,7 +1230,10 @@ function printSessionRows(rows, { json = false } = {}) {
     // board-spec-v0.4 §A1: a hook-recorded clue (fact, not inference) outranks
     // the "按 PR 号推断" label — never show both.
     const inferredMark = r.via === "hook" ? "  [hook]" : r.prInferred ? "  [按 PR 号推断]" : "";
-    console.log(`${id8}  ${pinnedMark}  ${verdictLabel}${reason}  [${branchesStr}]${inferredMark}  ${oneLine(r.title)}`);
+    const suggestMark = r.suggest ? `  [建议:${r.suggest.kind}]` : "";
+    console.log(
+      `${id8}  ${pinnedMark}  ${verdictLabel}${reason}  [${branchesStr}]${inferredMark}${suggestMark}  ${oneLine(r.title)}`
+    );
   }
 }
 
@@ -1234,10 +1251,10 @@ function combineJudges(judges) {
 // Merges buildSessionListing() output across every workspace repo into one
 // row per session uuid, prefixing branches with their repo so the same branch
 // name in two repos doesn't collide.
-function buildWorkspaceSessionRows(repoContexts, cacheDir, { pinnedOnly = false } = {}) {
+function buildWorkspaceSessionRows(repoContexts, cacheDir, { pinnedOnly = false, staleDays = 14 } = {}) {
   const combined = new Map();
   for (const rc of repoContexts) {
-    const rows = buildSessionListing(rc.repoRoot, cacheDir, rc.gitCtx, { pinnedOnly });
+    const rows = buildSessionListing(rc.repoRoot, cacheDir, rc.gitCtx, { pinnedOnly, staleDays });
     for (const r of rows) {
       const entry = combined.get(r.uuid) || {
         uuid: r.uuid,
@@ -1273,6 +1290,12 @@ function buildWorkspaceSessionRows(repoContexts, cacheDir, { pinnedOnly = false 
     judge: combineJudges(e.judges),
   }));
   out.sort((a, b) => new Date(b.lastActive || 0).getTime() - new Date(a.lastActive || 0).getTime());
+  // Recomputed against the COMBINED judge (not any single repo's), since the
+  // same session can be "can-close" in one repo and "no-clue"/"keep" in
+  // another — per-repo suggest would be wrong here. Cheap: attachSuggestions
+  // was already called per repo above, but that per-repo work is superseded
+  // by this pass, not reused.
+  attachSuggestions(out, cacheDir, staleDays);
   return out;
 }
 
@@ -1323,6 +1346,113 @@ function cmdSessionsLs(flags) {
   const gitCtx = buildGitCtx(boardRoot, config);
   const rows = buildSessionListing(boardRoot, cacheDir, gitCtx, { pinnedOnly: !!flags.pinned });
   printSessionRows(rows, opts);
+}
+
+// --- sessions judge --------------------------------------------------------------
+//
+// Rule layer is always on (attachSuggestions() already ran inside
+// buildSessionListing/buildWorkspaceSessionRows above — this command's own
+// job is just to print it as a table, and, with --ai, ALSO ask `claude -p`
+// about the rows the rule layer couldn't confidently place).
+
+// Builds the full (unfiltered-by-pinned) row set this command judges over —
+// always the whole session universe, since "which conversations can I
+// archive" isn't a --pinned-scoped question the way `sessions ls` sometimes is.
+function buildJudgeRows(flags, cacheDir, staleDays) {
+  if (isWorkspaceMode(flags)) {
+    const repoContexts = buildRepoContexts();
+    return buildWorkspaceSessionRows(repoContexts, cacheDir, { pinnedOnly: false, staleDays });
+  }
+  const boardRoot = resolveBoardRoot();
+  const config = loadRepoConfig(boardRoot);
+  const gitCtx = buildGitCtx(boardRoot, config);
+  return buildSessionListing(boardRoot, cacheDir, gitCtx, { pinnedOnly: false, staleDays });
+}
+
+function printSuggestTable(rows) {
+  const withSuggest = rows.filter((r) => r.suggest);
+  if (withSuggest.length === 0) {
+    console.log("(no suggestions — 规则和 AI 都没找到可归档的对话)");
+    return;
+  }
+  console.log(["title", "kind", "reason", "appSessionId"].join("\t"));
+  for (const r of withSuggest) {
+    console.log(
+      [oneLine(r.title), r.suggest.kind, oneLine(r.suggest.reason), r.appSessionId || "-"].join("\t")
+    );
+  }
+}
+
+// claude CLI 缺失/非零退出永不抛出——降级为规则结果 + 一行 WARN，见 board-spec
+// judge --ai。isError 只用于内部区分“跳过了 AI”和“正常跑完”，不对外抛异常。
+function callClaudeJudge(prompt) {
+  const check = spawnSync("claude", ["--version"], { encoding: "utf8" });
+  if (check.error) {
+    console.error("WARN 未找到 claude 命令，跳过 AI 判定，仅保留规则结果");
+    return { isError: true };
+  }
+  const res = spawnSync("claude", ["-p", prompt, "--output-format", "json"], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (res.error || res.status !== 0) {
+    const detail = res.error ? res.error.message : `exit ${res.status}: ${(res.stderr || "").trim()}`;
+    console.error(`WARN claude -p 调用失败（${detail}），跳过 AI 判定，仅保留规则结果`);
+    return { isError: true };
+  }
+  return { isError: false, stdout: res.stdout || "" };
+}
+
+async function cmdSessionsJudge(flags) {
+  const cacheDir = resolveCacheDir();
+  const staleDaysRaw = flags["stale-days"] ? parseInt(flags["stale-days"], 10) : NaN;
+  const staleDays = Number.isFinite(staleDaysRaw) && staleDaysRaw > 0 ? staleDaysRaw : 14;
+
+  const rows = buildJudgeRows(flags, cacheDir, staleDays);
+
+  if (!flags.ai) {
+    printSuggestTable(rows);
+    return;
+  }
+
+  const judgeCache = sessionsLib.loadJudgeCache(cacheDir);
+  // 规则+已有缓存已经在 buildJudgeRows -> attachSuggestions 里跑过一轮，这里
+  // 重新算一遍纯规则 Map 只是为了拿到 suggestByUuid 传给 selectAiJudgeCandidates
+  // 判断哪些行是 dup-title（不重复计算 judge，rows 上已经有）。
+  const ruleSuggestOnly = sessionsLib.suggestArchive(rows, { now: Date.now(), staleDays });
+  const candidates = sessionsLib.selectAiJudgeCandidates(rows, ruleSuggestOnly, { cap: 120 });
+  const needing = sessionsLib.filterRowsNeedingAiJudge(candidates, judgeCache);
+
+  if (flags["dry-run"]) {
+    const prompt = sessionsLib.buildAiJudgePrompt(needing);
+    console.log(prompt);
+    console.log(`\n[dry-run] 候选 ${candidates.length} 条，其中 ${needing.length} 条命中缓存失效需要新判（未调用 claude）`);
+    return;
+  }
+
+  if (needing.length === 0) {
+    console.error(`AI 候选 ${candidates.length} 条全部命中缓存，无需调用 claude`);
+  } else {
+    const prompt = sessionsLib.buildAiJudgePrompt(needing);
+    const result = callClaudeJudge(prompt);
+    if (!result.isError) {
+      const decisions = sessionsLib.parseAiJudgeResponse(result.stdout);
+      if (decisions.length === 0) {
+        console.error("WARN claude -p 输出解析不出有效判定（可能被别的文字包住了），仅保留规则结果");
+      } else {
+        const nextCache = sessionsLib.mergeJudgeDecisions(judgeCache, needing, decisions);
+        sessionsLib.saveJudgeCache(cacheDir, nextCache);
+        console.error(`AI 判完 ${decisions.length}/${needing.length} 条，已写入缓存`);
+      }
+    }
+  }
+
+  // Re-attach suggestions from disk so the printed table reflects whatever
+  // just got persisted (freshly judged this run, or already-cached from a
+  // previous run) — same code path `sessions ls`/`render` use, so the table
+  // here is never out of sync with what those show next time.
+  attachSuggestions(rows, cacheDir, staleDays);
+  printSuggestTable(rows);
 }
 
 // --- import vibe-kanban ---------------------------------------------------------
@@ -1578,6 +1708,11 @@ function printHelp() {
   sessions scan                                增量扫描 Claude/Codex 转录，匹配到本仓库分支
   sessions import <file.json>                  导入桌面 app 的 list_sessions 元数据（与仓库无关，写 workspace.cache）
   sessions ls [--all] [--pinned] [--json]      列出对话：分支、可关/别关/无线索 + 理由
+  sessions judge [--all] [--ai] [--dry-run] [--stale-days N]
+                                                打印归档建议表（landed/dup-title/stale-chat 规则always-on；
+                                                --ai 额外把 no-clue/dup-title 行发给 claude -p 判 archive/keep/ask；
+                                                --dry-run 只打印会发送的 prompt 和条数，不调用 claude；
+                                                建议仅供参考，归档仍需用户点头）
   import vibe-kanban [path] [--repo p] [--branchless] [--apply]
                                                 导入 vibe-kanban 本地任务为卡片（默认 dry-run，--apply 才写；
                                                 path 缺省时用 vibe-kanban 默认数据库路径，见 README）
@@ -1736,8 +1871,11 @@ async function main() {
           case "ls":
             cmdSessionsLs(flags);
             break;
+          case "judge":
+            await cmdSessionsJudge(flags);
+            break;
           default:
-            console.error("用法: board sessions <scan|import <file.json>|ls [--pinned]>");
+            console.error("用法: board sessions <scan|import <file.json>|ls [--pinned]|judge [--ai] [--dry-run] [--stale-days N]>");
             process.exit(1);
         }
         break;
