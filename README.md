@@ -77,6 +77,8 @@ board sync --all                     # 刷新所有仓库的卡片派生字段�
 board render --all                   # 生成汇总页 index.html
 board sessions ls --all --pinned     # 列出置顶对话：分支、可关/别关/无线索
 board sessions judge --all --ai      # 打印归档建议表（规则常开，--ai 额外让 claude -p 判定拿不准的对话）
+board ls --all --repo goodcaseai --limit 20          # 按仓过滤 + 截断前 20 条（返回太大时用，比如 MCP 宿主会截断）
+board sessions judge --all --repo goodcaseai --limit 50   # 同上，作用在归档建议表
 ```
 
 汇总页 `index.html` 是一张静态页：顶部按仓库分 tab；每条分支右侧的对话 chip 同名聚类、超过 3 个折叠；chip 上的「打开」走 `claude://code/continue?session=<id>` 直接跳到桌面 app 里那个会话；每个仓库上方有「建议归档」面板，勾选后点「让 Claude 归档」会通过 `claude://code/new?prompt=…` 新开一个 Claude Code 会话，把清单交给 agent 逐个 `archive_session`（置顶的会话桌面 app 拒绝归档，先取消置顶）。实线是归属线（项目 → 分支 → 对话），橙色虚线是冲突线（两条分支改了同一批文件），右上角可开关。
@@ -109,6 +111,8 @@ board sync --all                     # refresh derived fields across every repo,
 board render --all                   # generate the summary index.html
 board sessions ls --all --pinned     # list pinned sessions: branches, can-close/keep/no-clue
 board sessions judge --all --ai      # print archive suggestions (rule layer always on; --ai also asks claude -p about the uncertain ones)
+board ls --all --repo goodcaseai --limit 20          # filter to one repo + cap at 20 rows (use when the output is too large, e.g. an MCP host truncating it)
+board sessions judge --all --repo goodcaseai --limit 50   # same, applied to the archive-suggestion table
 ```
 
 The summary `index.html` is a static page: one tab per repo at the top; session chips next to each branch are clustered by title and folded past three; the 打开 link on a chip is `claude://code/continue?session=<id>`, which jumps straight to that session in the Claude desktop app; each repo gets a 建议归档 panel whose button opens a new Claude Code session via `claude://code/new?prompt=…` carrying the checked list so the agent can `archive_session` them one by one (the desktop app refuses to archive pinned sessions, unpin first). Solid lines are ownership (project → branch → session); dashed accent lines are conflicts (two branches touched the same files), toggled top-right.

@@ -166,6 +166,27 @@ function forEachWorkspaceRepo(fn) {
   }
 }
 
+// Collects repoLabel for every configured (existing, git) workspace repo —
+// used to validate --repo before doing any real work, and to compose the
+// "可用: a, b, c" hint when the given label doesn't match any of them.
+function listWorkspaceRepoLabels() {
+  const labels = [];
+  forEachWorkspaceRepo((probe) => labels.push(probe.repoLabel));
+  return labels;
+}
+
+// Shared --repo validation for `ls`/`sessions judge`: exits 1 with a
+// human-readable message (listing what IS available) rather than silently
+// filtering down to nothing.
+function validateRepoFlag(repo) {
+  if (!repo) return;
+  const labels = listWorkspaceRepoLabels();
+  if (!labels.includes(repo)) {
+    console.error(`--repo ${repo} 不在工作区里，可用: ${labels.join(", ")}`);
+    process.exit(1);
+  }
+}
+
 function safeRealpath(p) {
   try {
     return fs.realpathSync(p);
@@ -528,21 +549,31 @@ function runSync(boardRoot, config, opts = {}) {
 // --- ls ------------------------------------------------------------------
 
 function printCardsTable(cards, args, { withRepo }) {
-  let filtered = cards;
-  if (args.status) filtered = filtered.filter((c) => c.status === args.status);
-  if (args.flag) filtered = filtered.filter((c) => (c.flags || []).includes(args.flag));
+  const filtered = store.filterCards(cards, { status: args.status, flag: args.flag, repo: args.repo });
+
+  let limited;
+  try {
+    limited = store.applyLimit(filtered, args.limit);
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1);
+  }
+  if (limited.truncated) {
+    console.error(`LIMIT 显示 ${limited.items.length}/${limited.total}`);
+  }
+  const shown = limited.items;
 
   if (args.json) {
-    console.log(JSON.stringify(filtered));
+    console.log(JSON.stringify(shown));
     return;
   }
 
-  if (filtered.length === 0) {
+  if (shown.length === 0) {
     console.log("(no cards)");
     return;
   }
 
-  const rows = filtered.map((c) => ({
+  const rows = shown.map((c) => ({
     ...(withRepo ? { repo: c.repo || "-" } : {}),
     id: c.id,
     status: c.status,
@@ -580,13 +611,21 @@ function printCardsTable(cards, args, { withRepo }) {
 }
 
 function cmdLs(args) {
-  if (isWorkspaceMode(args)) {
+  // --repo implies workspace mode (need every repo's cards to pick one out
+  // of), same as --all.
+  if (isWorkspaceMode(args) || args.repo) {
     let allCards = [];
+    const labels = [];
     forEachWorkspaceRepo((probe) => {
+      labels.push(probe.repoLabel);
       const tasksDir = store.tasksDirFor(probe.repoRoot);
       const cards = store.readAllCards(tasksDir).map((c) => ({ ...c.data, repo: c.data.repo || probe.repoLabel }));
       allCards = allCards.concat(cards);
     });
+    if (args.repo && !labels.includes(args.repo)) {
+      console.error(`--repo ${args.repo} 不在工作区里，可用: ${labels.join(", ")}`);
+      process.exit(1);
+    }
     printCardsTable(allCards, args, { withRepo: true });
     return;
   }
@@ -1359,7 +1398,9 @@ function cmdSessionsLs(flags) {
 // always the whole session universe, since "which conversations can I
 // archive" isn't a --pinned-scoped question the way `sessions ls` sometimes is.
 function buildJudgeRows(flags, cacheDir, staleDays) {
-  if (isWorkspaceMode(flags)) {
+  // --repo implies workspace mode (need every repo's sessions to pick branch
+  // matches for one out of), same as --all.
+  if (isWorkspaceMode(flags) || flags.repo) {
     const repoContexts = buildRepoContexts();
     return buildWorkspaceSessionRows(repoContexts, cacheDir, { pinnedOnly: false, staleDays });
   }
@@ -1369,14 +1410,30 @@ function buildJudgeRows(flags, cacheDir, staleDays) {
   return buildSessionListing(boardRoot, cacheDir, gitCtx, { pinnedOnly: false, staleDays });
 }
 
-function printSuggestTable(rows) {
+// `limit` truncates the printed suggestion rows (the ones with `.suggest`
+// set), not the full row set — a row without a suggestion never printed
+// anyway, so counting it against --limit would make the limit line lie.
+function printSuggestTable(rows, { limit } = {}) {
   const withSuggest = rows.filter((r) => r.suggest);
-  if (withSuggest.length === 0) {
+
+  let limited;
+  try {
+    limited = store.applyLimit(withSuggest, limit);
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1);
+  }
+  if (limited.truncated) {
+    console.error(`LIMIT 显示 ${limited.items.length}/${limited.total}`);
+  }
+  const shown = limited.items;
+
+  if (shown.length === 0) {
     console.log("(no suggestions — 规则和 AI 都没找到可归档的对话)");
     return;
   }
   console.log(["title", "kind", "reason", "appSessionId"].join("\t"));
-  for (const r of withSuggest) {
+  for (const r of shown) {
     console.log(
       [oneLine(r.title), r.suggest.kind, oneLine(r.suggest.reason), r.appSessionId || "-"].join("\t")
     );
@@ -1408,10 +1465,22 @@ async function cmdSessionsJudge(flags) {
   const staleDaysRaw = flags["stale-days"] ? parseInt(flags["stale-days"], 10) : NaN;
   const staleDays = Number.isFinite(staleDaysRaw) && staleDaysRaw > 0 ? staleDaysRaw : 14;
 
+  if (flags.repo) validateRepoFlag(flags.repo);
+
+  // `rows` stays the full (unfiltered-by-repo) universe throughout — the AI
+  // candidate selection below deliberately runs over the whole set even
+  // under --repo (board-spec: --repo/--limit only narrow what gets PRINTED,
+  // never what the AI layer judges over). `printRows` is the repo-filtered
+  // view used at both print call sites below.
   const rows = buildJudgeRows(flags, cacheDir, staleDays);
+  // --repo only keeps rows with a branch clue attributed to that repo —
+  // dup-title/stale-chat/ai-archive rows (judged on title/staleness alone,
+  // no branch) have nothing to filter by and are dropped. That's by design:
+  // see sessions.mjs filterRowsByRepo.
+  const printRows = flags.repo ? sessionsLib.filterRowsByRepo(rows, flags.repo) : rows;
 
   if (!flags.ai) {
-    printSuggestTable(rows);
+    printSuggestTable(printRows, { limit: flags.limit });
     return;
   }
 
@@ -1452,7 +1521,7 @@ async function cmdSessionsJudge(flags) {
   // previous run) — same code path `sessions ls`/`render` use, so the table
   // here is never out of sync with what those show next time.
   attachSuggestions(rows, cacheDir, staleDays);
-  printSuggestTable(rows);
+  printSuggestTable(flags.repo ? sessionsLib.filterRowsByRepo(rows, flags.repo) : rows, { limit: flags.limit });
 }
 
 // --- import vibe-kanban ---------------------------------------------------------
@@ -1697,7 +1766,10 @@ function printHelp() {
 不在任何 git 仓库里跑时自动进入工作区模式）:
   init [--repos a,b,c] [--output p] [--cache p]   初始化 ~/.config/board/config.json（已存在则只打印不覆盖）
   sync [--all] [--dry-run] [--no-discover] [--fetch] [--no-sessions]   刷新卡片派生字段（默认顺带增量扫对话）
-  ls [--all] [--status x] [--flag y] [--json]  列出卡片（含 stage、conflicts_with；--all 加仓库列）
+  ls [--all] [--repo x] [--limit N] [--status x] [--flag y] [--json]
+                                                列出卡片（含 stage、conflicts_with；--all/--repo 加仓库列；
+                                                --repo 按 repo 名精确过滤，隐含 --all；--repo 值不在工作区时报错列出可用值；
+                                                --limit N 在过滤之后截断前 N 条，被截断时 stderr 打一行 "LIMIT 显示 N/M"）
   repos                                        列出 workspace.repos 及各自状态（存在/缺配置/卡片数）
   add --branch <b> [--title t] [--agent a]     手动建卡（单仓）
   next <id> "<text>"                           写 next_step
@@ -1708,10 +1780,14 @@ function printHelp() {
   sessions scan                                增量扫描 Claude/Codex 转录，匹配到本仓库分支
   sessions import <file.json>                  导入桌面 app 的 list_sessions 元数据（与仓库无关，写 workspace.cache）
   sessions ls [--all] [--pinned] [--json]      列出对话：分支、可关/别关/无线索 + 理由
-  sessions judge [--all] [--ai] [--dry-run] [--stale-days N]
+  sessions judge [--all] [--repo x] [--limit N] [--ai] [--dry-run] [--stale-days N]
                                                 打印归档建议表（landed/dup-title/stale-chat 规则always-on；
-                                                --ai 额外把 no-clue/dup-title 行发给 claude -p 判 archive/keep/ask；
+                                                --ai 额外把 no-clue/dup-title 行发给 claude -p 判 archive/keep/ask
+                                                （--ai 候选判定始终跑全量，不受 --repo/--limit 影响，两者只影响打印）；
                                                 --dry-run 只打印会发送的 prompt 和条数，不调用 claude；
+                                                --repo x 隐含 --all，只列有该仓分支线索的行（dup-title/stale-chat 等
+                                                无分支线索的行会被排掉）；--repo 值不在工作区时报错列出可用值；
+                                                --limit N 在打印的建议行上截断，被截断时 stderr 打一行 "LIMIT 显示 N/M"；
                                                 建议仅供参考，归档仍需用户点头）
   import vibe-kanban [path] [--repo p] [--branchless] [--apply]
                                                 导入 vibe-kanban 本地任务为卡片（默认 dry-run，--apply 才写；
@@ -1875,7 +1951,9 @@ async function main() {
             await cmdSessionsJudge(flags);
             break;
           default:
-            console.error("用法: board sessions <scan|import <file.json>|ls [--pinned]|judge [--ai] [--dry-run] [--stale-days N]>");
+            console.error(
+              "用法: board sessions <scan|import <file.json>|ls [--pinned]|judge [--repo x] [--limit N] [--ai] [--dry-run] [--stale-days N]>"
+            );
             process.exit(1);
         }
         break;
