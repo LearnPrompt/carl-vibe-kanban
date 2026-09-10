@@ -1727,7 +1727,7 @@ function cmdRender(flags) {
 
   const { workspace } = loadUserConfig();
   const outPath = workspaceMode
-    ? path.resolve(git.expandHome((workspace && workspace.output) || "~/agent-workbench/board/index.html"))
+    ? path.resolve(git.expandHome((workspace && workspace.output) || "~/.cache/board/index.html"))
     : path.join(repoEntries[0].repoRoot, "board", "index.html");
   fs.mkdirSync(path.dirname(outPath), { recursive: true });
   fs.writeFileSync(outPath, html, "utf8");

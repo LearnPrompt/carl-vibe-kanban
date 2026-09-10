@@ -1,0 +1,1079 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>board</title>
+<style>
+:root {
+  --bg: #FAFAF7;
+  --panel: #FFFFFF;
+  --ink: #141412;
+  --ink-soft: #6B6A64;
+  --line: #141412;
+  --line-faint: #D8D7D0;
+  --accent: #FF4400;
+  --accent-soft: #FFE8DF;
+  --ok: #1F7A3A;
+  --warn: #B7791F;
+  --hdr: 52px;
+  --tabs: 38px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131311;
+    --panel: #1B1B18;
+    --ink: #EDECE6;
+    --ink-soft: #8F8E86;
+    --line: #EDECE6;
+    --line-faint: #33322E;
+    --accent: #FF5511;
+    --accent-soft: #3A1A0D;
+    --ok: #4FBF6F;
+    --warn: #E0A43C;
+  }
+}
+* { box-sizing: border-box; border-radius: 0; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Helvetica Neue", "Avenir Next", "PingFang SC", "Microsoft YaHei", Helvetica, Arial, sans-serif;
+  font-size: 14px;
+}
+a { color: var(--accent); }
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+}
+
+/* ---- header ---- */
+header.board-header {
+  display: flex;
+  align-items: stretch;
+  min-height: var(--hdr);
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px;
+  border-right: 1px solid var(--line);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.brand .sq {
+  width: 10px;
+  height: 10px;
+  background: var(--accent);
+  display: inline-block;
+}
+.hdr-subtitle {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 120px;
+  padding: 0 16px;
+  border-right: 1px solid var(--line-faint);
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+.conflict-toggle-btn {
+  font: inherit;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  font-weight: 700;
+  background: transparent;
+  color: var(--ink-soft);
+  border: 1px solid var(--line-faint);
+  margin: 8px 0 8px 16px;
+  padding: 0 12px;
+  cursor: pointer;
+}
+.conflict-toggle-btn:hover { color: var(--ink); border-color: var(--ink); }
+.hdr-stats {
+  margin-left: 16px;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  border-left: 1px solid var(--line-faint);
+  font-size: 11px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.hdr-stats strong { color: var(--accent); font-weight: 700; }
+
+/* ---- summary + legend ---- */
+.summary-bar {
+  padding: 8px 24px 4px 24px;
+  border-bottom: 1px solid var(--line-faint);
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 0 24px 8px 24px;
+  border-bottom: 1px solid var(--line-faint);
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+.legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.legend-cell { width: 12px; height: 12px; display: inline-block; border: 1px solid var(--ink-soft); }
+.legend-cell.stage-accent { background: var(--accent); border-color: transparent; }
+.legend-cell.stage-warn { background: var(--warn); border-color: transparent; }
+.legend-cell.stage-ok { background: var(--ok); border-color: transparent; }
+/* 线型图例：实线=归属（项目→分支→对话），橙虚线=冲突对 */
+.legend-line {
+  width: 24px;
+  height: 0;
+  display: inline-block;
+  border-top: 1.5px solid var(--line-faint);
+  transform: translateY(-3px);
+}
+.legend-line.dashed { border-top-style: dashed; border-top-color: var(--accent); }
+
+/* ---- repo tabs (sticky, one per project + 全部) ---- */
+.repo-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  /* 8 个 repo 一行放不完（1440 下 afu-llm-todo 之后的项目直接被裁掉看不见），
+     所以换行而不是横向滚动。分隔线走每个 tab 的 border-left/border-top 加
+     -1px 外边距：相邻 tab 的边框叠成一根，每行第一个 tab 的左边线、第一行的
+     顶边线都被 overflow:hidden 裁在盒子外，两行都不会留下悬空的半截线。 */
+  flex-wrap: wrap;
+  overflow: hidden;
+  min-height: var(--tabs);
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.repo-tab {
+  font: inherit;
+  font-size: 13px;
+  background: transparent;
+  color: var(--ink-soft);
+  border: none;
+  border-left: 1px solid var(--line-faint);
+  border-top: 1px solid var(--line-faint);
+  border-bottom: 1.5px solid transparent;
+  margin-left: -1px;
+  margin-top: -1px;
+  padding: 6px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex: none;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.repo-tab:hover { color: var(--ink); }
+.repo-tab.active {
+  color: var(--ink);
+  font-weight: 700;
+  background: var(--accent-soft);
+  border-bottom-color: var(--accent);
+  /* 换行后第二行的 -1px 顶边会压住第一行 active tab 的重音下划线，抬一层。 */
+  position: relative;
+  z-index: 1;
+}
+.repo-tab .repo-tab-counts {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--ink-soft);
+}
+.project-section[hidden] { display: none; }
+
+/* ---- tree: project section ---- */
+.project-section { border-bottom: 1px solid var(--line); }
+.section-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.kicker {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.section-title {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 19px;
+  font-weight: 700;
+}
+.section-title .sq {
+  width: 10px;
+  height: 10px;
+  background: var(--accent);
+  display: inline-block;
+  flex: none;
+}
+.section-stats {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
+.tree-scroll { overflow-x: auto; }
+.tree-grid {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  min-width: 1100px;
+  padding: 16px 24px;
+}
+.conn-svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.conn-line { fill: none; stroke: var(--line-faint); stroke-width: 1.5px; }
+.conn-line.conn-conflict { stroke: var(--accent); stroke-dasharray: 4 3; }
+body[data-conflicts="off"] .conn-line.conn-conflict { display: none; }
+
+/* 项目节点列：贴顶吸附，跟随该项目节滚动；旁边留 56px 给一根贯穿所有行的
+   竖线（trunk），每行再横向接回分支节点左边缘（见 .node.branch-node::before）。 */
+.tree-col-project {
+  flex: 0 0 220px;
+  width: 220px;
+  margin-right: 56px;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+.project-trunk-line {
+  position: absolute;
+  top: 44px;
+  bottom: 44px;
+  right: -28px;
+  width: 0;
+  border-left: 1.5px solid var(--line-faint);
+}
+.tree-col-rows {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+/* 每行 = 一条分支 + 它的全部对话，三列固定宽度，中格留给连接线。 */
+.branch-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: 380px 56px minmax(360px, 1fr);
+  align-items: start;
+}
+.row-spine {
+  position: absolute;
+  left: 408px;
+  top: 20px;
+  bottom: 20px;
+  width: 0;
+  border-left: 1.5px solid var(--line-faint);
+}
+.row-convs {
+  grid-column: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.node {
+  border: 1px solid var(--line-faint);
+  background: var(--panel);
+  padding: 12px;
+  position: relative;
+}
+.project-node {
+  border-color: var(--line);
+  position: sticky;
+  top: calc(var(--tabs) + 16px);
+  align-self: start;
+}
+.node-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.node-head .sq { width: 10px; height: 10px; background: var(--accent); display: inline-block; flex: none; }
+.node-title { font-size: 16px; font-weight: 700; }
+.node-sub { color: var(--ink-soft); font-size: 11px; margin-bottom: 6px; }
+.stat-line { font-size: 12px; color: var(--ink-soft); }
+
+/* ---- branch node ---- */
+.branch-node { border-color: var(--line-faint); }
+/* left connector: every branch row hangs off the project trunk line (56px
+   outer gap between .tree-col-project and .tree-col-rows) */
+.branch-node::before {
+  content: "";
+  position: absolute;
+  left: -28px;
+  top: 50%;
+  width: 28px;
+  height: 0;
+  border-top: 1.5px solid var(--line-faint);
+}
+/* right connector: only drawn when the row has conversation chips (meets
+   .row-spine in the row's own 56px middle gap) */
+.branch-node.has-conv::after {
+  content: "";
+  position: absolute;
+  right: -28px;
+  top: 50%;
+  width: 28px;
+  height: 0;
+  border-top: 1.5px solid var(--line-faint);
+}
+.stage-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+.stage-bar { display: inline-flex; gap: 3px; flex: none; }
+.stage-cell {
+  width: 14px;
+  height: 14px;
+  border: 1px solid var(--ink-soft);
+  display: inline-block;
+  background: transparent;
+}
+.stage-cell.filled { border-color: transparent; }
+.stage-cell.filled.stage-accent { background: var(--accent); }
+.stage-cell.filled.stage-warn { background: var(--warn); }
+.stage-cell.filled.stage-ok { background: var(--ok); }
+.stage-name { font-size: 12px; color: var(--ink-soft); }
+.stage-offlabel {
+  font-size: 10px;
+  border: 1px solid var(--ink-soft);
+  color: var(--ink-soft);
+  padding: 0 4px;
+}
+.branch-title { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
+.branch-meta {
+  font-size: 12px;
+  color: var(--ink-soft);
+  margin-bottom: 4px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.pr-link { color: var(--accent); text-decoration: underline; }
+.next-step { font-size: 12px; font-style: italic; }
+.next-step.empty { color: var(--ink-soft); }
+.conflict-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-size: 11px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 0 4px;
+}
+
+/* ---- conversation chips (right cell of .branch-row) ---- */
+.conv-empty { font-size: 12px; color: var(--ink-soft); font-style: italic; padding: 4px 0; }
+.conv-chip { border: 1px solid var(--line-faint); padding: 6px 8px; position: relative; }
+/* stub back to the row's spine, plus a 6px solid square where the line
+   enters the chip */
+.conv-chip::before {
+  content: "";
+  position: absolute;
+  left: -28px;
+  top: 50%;
+  width: 28px;
+  height: 0;
+  border-top: 1.5px solid var(--line-faint);
+}
+.conv-chip::after {
+  content: "";
+  position: absolute;
+  left: -6px;
+  top: calc(50% - 3px);
+  width: 6px;
+  height: 6px;
+  background: var(--line-faint);
+}
+.conv-chip summary {
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 14px;
+}
+.verdict-sq { width: 10px; height: 10px; display: inline-block; flex: none; }
+.verdict-sq.verdict-can-close { background: var(--ok); }
+.verdict-sq.verdict-keep { background: var(--accent); }
+.verdict-sq.verdict-no-clue { background: var(--ink-soft); }
+.conv-title { font-size: 14px; font-weight: 600; }
+.conv-time { font-size: 11px; color: var(--ink-soft); }
+.pinned-mark {
+  border: 1px solid var(--ink);
+  color: var(--ink);
+  text-transform: uppercase;
+  padding: 0 4px;
+  font-size: 10px;
+}
+.hook-mark, .pr-inferred-mark {
+  border: 1px solid var(--line-faint);
+  color: var(--ink-soft);
+  text-transform: uppercase;
+  padding: 0 4px;
+  font-size: 10px;
+}
+.conv-reason { font-size: 12px; color: var(--ink-soft); padding-top: 4px; }
+.landed-node .stat-line { font-size: 14px; font-weight: 700; color: var(--ink); }
+
+/* 同名对话聚成一个 chip，展开后逐条列出成员 */
+.cluster-mark {
+  border: 1px solid var(--ink-soft);
+  color: var(--ink-soft);
+  padding: 0 4px;
+  font-size: 10px;
+}
+.conv-members {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line-faint);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.conv-member { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; font-size: 13px; }
+.open-link {
+  margin-left: auto;
+  flex: none;
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent);
+}
+.open-link.disabled {
+  color: var(--ink-soft);
+  border-bottom: 1px dashed var(--line-faint);
+  cursor: default;
+}
+
+/* 超过 N 条后折叠的剩余对话 */
+details.conv-more { border: 1px solid var(--line-faint); padding: 6px 8px; position: relative; }
+details.conv-more > summary { cursor: pointer; color: var(--ink-soft); }
+details.conv-more .conv-list-flat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 6px;
+}
+/* 折叠盒里的 chip 不再往左画归属线（线只属于树的一层） */
+details.conv-more .conv-chip::before,
+details.conv-more .conv-chip::after { display: none; }
+
+/* ---- 建议归档面板 ---- */
+details.archive-panel {
+  background: var(--panel);
+  border-bottom: 1px solid var(--line-faint);
+  padding: 0 24px 12px 24px;
+}
+details.archive-panel > summary {
+  cursor: pointer;
+  padding: 10px 0;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--ink);
+}
+.archive-note { color: var(--warn); padding-bottom: 6px; }
+/* 标题上的「+N 转录」：那批归档不了，压成次要信息，别抢主计数 */
+.archive-rest-count {
+  margin-left: 8px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--ink-soft);
+}
+/* 无 app id 的会话桌面 app 归档不了，默认收起，不给勾选框 */
+details.archive-rest { margin-top: 12px; }
+details.archive-rest > summary {
+  cursor: pointer;
+  padding: 6px 0;
+  color: var(--ink-soft);
+  border-top: 1px solid var(--line-faint);
+}
+details.archive-rest > summary:hover { color: var(--ink); }
+details.archive-rest .archive-rows { border-top: none; padding-top: 4px; }
+/* 一个项目可能攒了上百条建议，面板默认展开但自己滚，别把下面的树顶出屏幕 */
+.archive-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-top: 1px solid var(--line-faint);
+  padding-top: 8px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.archive-row { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+/* chip 里「打开」推到右边，归档行是整宽的，推到右边就跟标题断了联系 */
+.archive-row .open-link { margin-left: 0; }
+.archive-row input {
+  margin: 0;
+  flex: none;
+  accent-color: var(--accent);
+  transform: translateY(1px);
+}
+.archive-title { font-weight: 600; }
+.archive-reason { color: var(--ink-soft); }
+.archive-btn {
+  font: inherit;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  font-weight: 700;
+  margin-top: 10px;
+  align-self: flex-start;
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  padding: 4px 12px;
+  cursor: pointer;
+}
+.archive-btn:hover { background: var(--accent-soft); }
+
+details.group-details.nested { margin: 8px 0 0 0; border-left: 1px solid var(--line-faint); padding-left: 12px; }
+details.group-details.nested summary { font-weight: 400; color: var(--ink-soft); font-size: 12px; cursor: pointer; }
+
+details.bottom-details {
+  border-top: 1px solid var(--line);
+}
+details.bottom-details summary {
+  cursor: pointer;
+  padding: 10px 24px;
+  font-size: 12px;
+  font-weight: 700;
+  background: var(--panel);
+}
+details.bottom-details .conv-list-flat {
+  margin: 0 24px 12px 24px;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+@media (max-width: 900px) {
+  header.board-header { flex-wrap: wrap; height: auto; }
+  .hdr-subtitle { order: 3; border-right: none; flex-basis: 100%; }
+  .hdr-stats { border-left: 1px solid var(--line-faint); }
+  .section-stats { margin-left: 0; flex-basis: 100%; }
+}
+</style>
+</head>
+<body data-conflicts="on">
+<header class="board-header">
+  <div class="brand"><span class="sq"></span>BOARD</div>
+  <div class="hdr-subtitle">agent 任务板 · 对话 → 分支 → 落地</div>
+  <button type="button" id="conflict-toggle" class="conflict-toggle-btn" onclick="boardToggleConflicts()">冲突线 开</button>
+  <div class="hdr-stats mono"><strong>4</strong>&nbsp;置顶 · <strong>3</strong>&nbsp;可关</div>
+</header>
+<nav class="repo-tabs">
+  <button type="button" class="repo-tab" data-repo="__all__" onclick="boardSelectRepo(this.getAttribute('data-repo'))">全部<span class="repo-tab-counts mono">9 卡 · 1 审 · 4 可关</span></button>
+  <button type="button" class="repo-tab active" data-repo="webapp" onclick="boardSelectRepo(this.getAttribute('data-repo'))">webapp<span class="repo-tab-counts mono">7 卡 · 1 审 · 3 可关</span></button>
+  <button type="button" class="repo-tab" data-repo="docs" onclick="boardSelectRepo(this.getAttribute('data-repo'))">docs<span class="repo-tab-counts mono">2 卡 · 0 审 · 1 可关</span></button>
+</nav>
+<div class="summary-bar mono">生成 2026-09-11 18:30 · 2 个仓库 · 9 张卡 · 11 个对话有线索 · 告警 1</div>
+<div class="legend">
+  <span class="legend-item"><span class="legend-cell stage-accent"></span>未提交</span>
+  <span class="legend-item"><span class="legend-cell stage-accent"></span>未推送</span>
+  <span class="legend-item"><span class="legend-cell stage-warn"></span>已推送</span>
+  <span class="legend-item"><span class="legend-cell stage-warn"></span>审阅中</span>
+  <span class="legend-item"><span class="legend-cell stage-ok"></span>已合并</span>
+  <span class="legend-item"><span class="legend-line"></span>归属线：项目 → 分支 → 对话</span>
+  <span class="legend-item"><span class="legend-line dashed"></span>冲突线：两条分支改了同一批文件（可用右上角开关）</span>
+</div>
+<script>
+function boardDrawConnectors() {
+  document.querySelectorAll(".tree-grid").forEach(function (grid) {
+    var svg = grid.querySelector("svg.conn-svg");
+    if (!svg) return;
+    var rect = grid.getBoundingClientRect();
+    svg.setAttribute("width", rect.width);
+    svg.setAttribute("height", rect.height);
+    svg.setAttribute("viewBox", "0 0 " + rect.width + " " + rect.height);
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+    var conflictsRaw = grid.getAttribute("data-conflicts");
+    var pairs = [];
+    try { pairs = JSON.parse(conflictsRaw || "[]"); } catch (e) { pairs = []; }
+    pairs.forEach(function (pair) {
+      var aEl = grid.querySelector('[data-branch="' + pair[0] + '"]');
+      var bEl = grid.querySelector('[data-branch="' + pair[1] + '"]');
+      if (!aEl || !bEl || aEl === bEl) return;
+      var a = aEl.getBoundingClientRect();
+      var b = bEl.getBoundingClientRect();
+      var x1 = a.left - rect.left;
+      var y1 = a.top + a.height / 2 - rect.top;
+      var x2 = b.left - rect.left;
+      var y2 = b.top + b.height / 2 - rect.top;
+      var bulgeX = Math.min(x1, x2) - 24;
+      var d = "M " + x1 + " " + y1 + " L " + bulgeX + " " + y1 + " L " + bulgeX + " " + y2 + " L " + x2 + " " + y2;
+      var path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      path.setAttribute("d", d);
+      path.setAttribute("class", "conn-line conn-conflict");
+      svg.appendChild(path);
+    });
+  });
+}
+function boardToggleConflicts() {
+  var on = document.body.getAttribute("data-conflicts") !== "off";
+  document.body.setAttribute("data-conflicts", on ? "off" : "on");
+  var btn = document.getElementById("conflict-toggle");
+  if (btn) btn.textContent = "冲突线 " + (on ? "关" : "开");
+}
+
+// ---- repo tabs ----------------------------------------------------------
+// 隐藏的 section 几何全是 0，切完必须重画一次冲突线。
+function boardSelectRepo(repo, persist) {
+  var tabs = document.querySelectorAll(".repo-tab");
+  for (var i = 0; i < tabs.length; i++) {
+    if (tabs[i].getAttribute("data-repo") === repo) tabs[i].classList.add("active");
+    else tabs[i].classList.remove("active");
+  }
+  var secs = document.querySelectorAll("section.project-section");
+  for (var j = 0; j < secs.length; j++) {
+    var sr = secs[j].getAttribute("data-repo");
+    secs[j].hidden = !(repo === "__all__" || sr === repo);
+  }
+  if (persist !== false) {
+    try { localStorage.setItem("board-repo", repo); } catch (e) {}
+    try { location.hash = "repo=" + encodeURIComponent(repo); } catch (e) {}
+  }
+  boardDrawConnectors();
+}
+function boardKnownRepo(repo) {
+  if (!repo) return false;
+  var tabs = document.querySelectorAll(".repo-tab");
+  for (var i = 0; i < tabs.length; i++) if (tabs[i].getAttribute("data-repo") === repo) return true;
+  return false;
+}
+function boardRestoreRepo() {
+  var want = null;
+  var m = /repo=([^&]+)/.exec(location.hash || "");
+  if (m) { try { want = decodeURIComponent(m[1]); } catch (e) { want = m[1]; } }
+  if (!boardKnownRepo(want)) { try { want = localStorage.getItem("board-repo"); } catch (e) { want = null; } }
+  if (!boardKnownRepo(want)) { boardDrawConnectors(); return; }
+  boardSelectRepo(want, false);
+}
+
+// ---- 建议归档 ------------------------------------------------------------
+function boardArchiveCount(el) {
+  var panel = el && el.closest ? el.closest("[data-archive]") : null;
+  if (!panel) return;
+  var boxes = panel.querySelectorAll("input.archive-cb");
+  var n = 0;
+  for (var i = 0; i < boxes.length; i++) {
+    if (boxes[i].checked && boxes[i].getAttribute("data-app-id")) n++;
+  }
+  var btn = document.getElementById(panel.getAttribute("data-archive") + "-btn");
+  if (btn) btn.textContent = "让 Claude 归档选中的 " + n + " 个";
+}
+function boardArchivePrompt(sectionId) {
+  var panel = document.querySelector('[data-archive="' + sectionId + '"]');
+  if (!panel) return;
+  var boxes = panel.querySelectorAll("input.archive-cb");
+  var lines = [];
+  for (var i = 0; i < boxes.length; i++) {
+    var appId = boxes[i].getAttribute("data-app-id");
+    if (!boxes[i].checked || !appId) continue;
+    lines.push("- " + boxes[i].getAttribute("data-title") + " — " + appId);
+  }
+  if (!lines.length) { window.alert("没有选中带 app id 的会话，桌面 app 归档不了。"); return; }
+  var text = "请用 archive_session 逐个归档以下桌面会话，reason 写「分支已合并」；置顶的先告诉我需要取消置顶，一个都别猜：\n" + lines.join("\n");
+  var url = "claude://code/new?prompt=" + encodeURIComponent(text);
+  var folder = panel.getAttribute("data-folder");
+  if (folder) url += "&folder=" + encodeURIComponent(folder);
+  window.location.href = url;
+}
+
+window.addEventListener("load", boardDrawConnectors);
+window.addEventListener("load", boardRestoreRepo);
+window.addEventListener("hashchange", boardRestoreRepo);
+window.addEventListener("resize", boardDrawConnectors);
+</script>
+<main>
+<section class="project-section" data-repo="webapp">
+  <div class="section-head">
+    <span class="kicker mono">§ 01 · acme/webapp</span>
+    <h2 class="section-title"><span class="sq"></span>webapp</h2>
+    <span class="section-stats mono">卡 7 · 待审 1 · 可关 3 · 别关对话 5</span>
+  </div>
+  <details class="archive-panel" open data-archive="ap-01" data-folder="/Users/demo/projects/webapp">
+  <summary class="mono">建议归档（3）</summary>
+  <div class="archive-note mono">置顶的会话桌面 app 拒绝归档，先在侧栏取消置顶</div>
+  <div class="archive-rows">
+    <div class="archive-row">
+      <input type="checkbox" class="archive-cb" checked data-app-id="local_a5000000-0000-4000-8000-000000000006" data-title="Rewrite API error messages" onchange="boardArchiveCount(this)" />
+      <span class="verdict-sq verdict-can-close" title="可关"></span>
+      <span class="archive-title" title="Rewrite API error messages">Rewrite API error messages</span>
+      <span class="archive-reason mono">判定：分支已合并</span>
+      <span class="pinned-mark mono">置顶</span><a class="open-link mono" href="claude://code/continue?session=local_a5000000-0000-4000-8000-000000000006&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+    </div>
+    <div class="archive-row">
+      <input type="checkbox" class="archive-cb" checked data-app-id="local_a5000000-0000-4000-8000-000000000007" data-title="Add error code docs" onchange="boardArchiveCount(this)" />
+      <span class="verdict-sq verdict-can-close" title="可关"></span>
+      <span class="archive-title" title="Add error code docs">Add error code docs</span>
+      <span class="archive-reason mono">判定：分支已合并</span>
+      <span class="pinned-mark mono">置顶</span><a class="open-link mono" href="claude://code/continue?session=local_a5000000-0000-4000-8000-000000000007&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+    </div>
+    <div class="archive-row">
+      <input type="checkbox" class="archive-cb" checked data-app-id="local_a6000000-0000-4000-8000-000000000008" data-title="Clean up legacy auth flow" onchange="boardArchiveCount(this)" />
+      <span class="verdict-sq verdict-can-close" title="可关"></span>
+      <span class="archive-title" title="Clean up legacy auth flow">Clean up legacy auth flow</span>
+      <span class="archive-reason mono">判定：分支已合并</span>
+      <span class="pinned-mark mono">置顶</span><a class="open-link mono" href="claude://code/continue?session=local_a6000000-0000-4000-8000-000000000008&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+    </div>
+  </div>
+  <button type="button" class="archive-btn mono" id="ap-01-btn" onclick="boardArchivePrompt('ap-01')">让 Claude 归档选中的 3 个</button>
+
+</details>
+  <div class="tree-scroll">
+    <div class="tree-grid" data-conflicts="[[&quot;feat/checkout-race-fix&quot;,&quot;feat/og-image-stats&quot;,2],[&quot;feat/api-error-messages&quot;,&quot;feat/checkout-race-fix&quot;,1]]">
+      <svg class="conn-svg"></svg>
+      <div class="tree-col-project">
+        <div class="node project-node">
+  <div class="node-head"><span class="sq"></span><span class="node-title">webapp</span></div>
+  <div class="node-sub mono">acme/webapp</div>
+  <div class="stat-line mono">卡 7</div>
+  <div class="stat-line mono">待审 1</div>
+  <div class="stat-line mono">别关对话 5</div>
+</div>
+        <div class="project-trunk-line"></div>
+      </div>
+      <div class="tree-col-rows">
+<div class="branch-row">
+  <div class="node branch-node has-conv" data-branch="feat/login-form-validation">
+  
+  <div class="stage-row"><span class="stage-bar"><span class="stage-cell filled stage-accent" title="dirty"></span><span class="stage-cell" title="unpushed"></span><span class="stage-cell" title="pushed"></span><span class="stage-cell" title="pr_open"></span><span class="stage-cell" title="merged"></span></span><span class="stage-name">未提交</span></div>
+  <div class="branch-title">Fix login form validation edge case</div>
+  <div class="branch-meta mono">
+    <span class="mono">feat/login-form-validation</span>
+    
+    <span class="mono">+0/−0</span>
+    <span class="mono">agent: claude</span>
+  </div>
+  <div class="next-step empty">未写下一步</div>
+</div>
+  <div class="row-spine"></div>
+  <div class="row-convs">
+<details class="conv-chip" data-session="local_a1000000-0000-4000-8000-000000000001">
+  <summary>
+    <span class="verdict-sq verdict-keep" title="别关"></span>
+    <span class="conv-title" title="Fix login form validation edge case">Fix login form validation edge case</span>
+    <span class="conv-time mono">19 小时前</span>
+    
+    
+    <a class="open-link mono" href="claude://code/continue?session=local_a1000000-0000-4000-8000-000000000001&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">还在改，本地有未提交改动</div>
+</details>
+  </div>
+</div>
+<div class="branch-row">
+  <div class="node branch-node has-conv" data-branch="feat/rate-limit-retry">
+  
+  <div class="stage-row"><span class="stage-bar"><span class="stage-cell" title="dirty"></span><span class="stage-cell filled stage-accent" title="unpushed"></span><span class="stage-cell" title="pushed"></span><span class="stage-cell" title="pr_open"></span><span class="stage-cell" title="merged"></span></span><span class="stage-name">未推送</span></div>
+  <div class="branch-title">Add retry backoff for rate limits</div>
+  <div class="branch-meta mono">
+    <span class="mono">feat/rate-limit-retry</span>
+    
+    <span class="mono">+3/−0</span>
+    <span class="mono">agent: claude</span>
+  </div>
+  <div class="next-step empty">未写下一步</div>
+</div>
+  <div class="row-spine"></div>
+  <div class="row-convs">
+<details class="conv-chip" data-session="local_a2000000-0000-4000-8000-000000000002">
+  <summary>
+    <span class="verdict-sq verdict-keep" title="别关"></span>
+    <span class="conv-title" title="Add retry backoff for rate limits">Add retry backoff for rate limits</span>
+    <span class="conv-time mono">23 小时前</span>
+    
+    
+    <a class="open-link mono" href="claude://code/continue?session=local_a2000000-0000-4000-8000-000000000002&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">feat/rate-limit-retry has 3 unpushed commits</div>
+</details>
+  </div>
+</div>
+<div class="branch-row">
+  <div class="node branch-node has-conv" data-branch="feat/checkout-race-fix">
+  <span class="conflict-badge mono">冲突 1</span>
+  <div class="stage-row"><span class="stage-bar"><span class="stage-cell" title="dirty"></span><span class="stage-cell" title="unpushed"></span><span class="stage-cell" title="pushed"></span><span class="stage-cell filled stage-warn" title="pr_open"></span><span class="stage-cell" title="merged"></span></span><span class="stage-name">审阅中</span></div>
+  <div class="branch-title">Fix checkout race on retry</div>
+  <div class="branch-meta mono">
+    <span class="mono">feat/checkout-race-fix</span>
+    <a class="pr-link mono" href="https://github.com/acme/webapp/pull/14" target="_blank" rel="noopener">#14 OPEN</a>
+    <span class="mono">+0/−0</span>
+    <span class="mono">agent: claude</span>
+  </div>
+  <div class="next-step empty">未写下一步</div>
+</div>
+  <div class="row-spine"></div>
+  <div class="row-convs">
+<details class="conv-chip" data-session="local_a4000000-0000-4000-8000-000000000005">
+  <summary>
+    <span class="verdict-sq verdict-keep" title="别关"></span>
+    <span class="conv-title" title="Fix checkout race on retry">Fix checkout race on retry</span>
+    <span class="conv-time mono">14 小时前</span>
+    
+    <span class="pinned-mark mono">置顶</span>
+    <span class="hook-mark mono">hook</span>
+    <span class="pr-inferred-mark mono">按 PR 号推断</span>
+    <a class="open-link mono" href="claude://code/continue?session=local_a4000000-0000-4000-8000-000000000005&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">PR 还在等 review</div>
+</details>
+  </div>
+</div>
+<div class="branch-row">
+  <div class="node branch-node has-conv" data-branch="feat/og-image-stats">
+  
+  <div class="stage-row"><span class="stage-bar"><span class="stage-cell" title="dirty"></span><span class="stage-cell" title="unpushed"></span><span class="stage-cell filled stage-warn" title="pushed"></span><span class="stage-cell" title="pr_open"></span><span class="stage-cell" title="merged"></span></span><span class="stage-name">已推送</span></div>
+  <div class="branch-title">Add OG image stats</div>
+  <div class="branch-meta mono">
+    <span class="mono">feat/og-image-stats</span>
+    
+    <span class="mono">+3/−0</span>
+    <span class="mono">agent: claude</span>
+  </div>
+  <div class="next-step empty">未写下一步</div>
+</div>
+  <div class="row-spine"></div>
+  <div class="row-convs">
+<details class="conv-chip" data-session="local_a3000000-0000-4000-8000-000000000003">
+  <summary>
+    <span class="verdict-sq verdict-keep" title="别关"></span>
+    <span class="conv-title" title="Add OG image stats">Add OG image stats</span>
+    <span class="conv-time mono">2 天前</span>
+    <span class="cluster-mark mono">×2</span>
+    
+    <a class="open-link mono" href="claude://code/continue?session=local_a3000000-0000-4000-8000-000000000003&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">等设计确认埋点字段</div>
+  <div class="conv-members"><div class="conv-member"><span class="conv-time mono">2 天前</span><span class="conv-title" title="Add OG image stats">Add OG image stats</span><a class="open-link mono" href="claude://code/continue?session=local_a3000000-0000-4000-8000-000000000003&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a></div><div class="conv-member"><span class="conv-time mono">2 天前</span><span class="conv-title" title="Add OG image stats (fork)">Add OG image stats (fork)</span><span class="open-link mono disabled" title="Codex 跳转待做">codex</span></div></div>
+</details>
+  </div>
+</div>
+<div class="branch-row">
+  <div class="node branch-node has-conv" data-branch="feat/api-error-messages">
+  <span class="conflict-badge mono">冲突 1</span>
+  <div class="stage-row"><span class="stage-bar"><span class="stage-cell" title="dirty"></span><span class="stage-cell" title="unpushed"></span><span class="stage-cell" title="pushed"></span><span class="stage-cell" title="pr_open"></span><span class="stage-cell filled stage-ok" title="merged"></span></span><span class="stage-name">已合并</span></div>
+  <div class="branch-title">Rewrite API error messages</div>
+  <div class="branch-meta mono">
+    <span class="mono">feat/api-error-messages</span>
+    <a class="pr-link mono" href="https://github.com/acme/webapp/pull/12" target="_blank" rel="noopener">#12 MERGED</a>
+    <span class="mono">+0/−0</span>
+    <span class="mono">agent: claude</span>
+  </div>
+  <div class="next-step empty">未写下一步</div>
+</div>
+  <div class="row-spine"></div>
+  <div class="row-convs">
+<details class="conv-chip" data-session="local_a5000000-0000-4000-8000-000000000006">
+  <summary>
+    <span class="verdict-sq verdict-can-close" title="可关"></span>
+    <span class="conv-title" title="Rewrite API error messages">Rewrite API error messages</span>
+    <span class="conv-time mono">3 天前</span>
+    
+    <span class="pinned-mark mono">置顶</span>
+    <span class="pr-inferred-mark mono">按 PR 号推断</span>
+    <a class="open-link mono" href="claude://code/continue?session=local_a5000000-0000-4000-8000-000000000006&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">PR #12 已合并</div>
+</details>
+<details class="conv-chip" data-session="local_a5000000-0000-4000-8000-000000000007">
+  <summary>
+    <span class="verdict-sq verdict-can-close" title="可关"></span>
+    <span class="conv-title" title="Add error code docs">Add error code docs</span>
+    <span class="conv-time mono">4 天前</span>
+    
+    <span class="pinned-mark mono">置顶</span>
+    <a class="open-link mono" href="claude://code/continue?session=local_a5000000-0000-4000-8000-000000000007&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">分支已合并，收尾对话可以关了</div>
+</details>
+  </div>
+</div>
+<div class="branch-row">
+  <div class="node branch-node has-conv" data-branch="feat/legacy-auth-cleanup">
+  
+  <div class="stage-row"><span class="stage-bar"><span class="stage-cell" title="dirty"></span><span class="stage-cell" title="unpushed"></span><span class="stage-cell" title="pushed"></span><span class="stage-cell" title="pr_open"></span><span class="stage-cell" title="merged"></span></span><span class="stage-name">已关闭</span><span class="stage-offlabel mono">closed</span></div>
+  <div class="branch-title">Clean up legacy auth flow</div>
+  <div class="branch-meta mono">
+    <span class="mono">feat/legacy-auth-cleanup</span>
+    <a class="pr-link mono" href="https://github.com/acme/webapp/pull/13" target="_blank" rel="noopener">#13 CLOSED</a>
+    <span class="mono">+0/−0</span>
+    <span class="mono">agent: claude</span>
+  </div>
+  <div class="next-step empty">未写下一步</div>
+</div>
+  <div class="row-spine"></div>
+  <div class="row-convs">
+<details class="conv-chip" data-session="local_a6000000-0000-4000-8000-000000000008">
+  <summary>
+    <span class="verdict-sq verdict-can-close" title="可关"></span>
+    <span class="conv-title" title="Clean up legacy auth flow">Clean up legacy auth flow</span>
+    <span class="conv-time mono">6 天前</span>
+    
+    <span class="pinned-mark mono">置顶</span>
+    <a class="open-link mono" href="claude://code/continue?session=local_a6000000-0000-4000-8000-000000000008&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">PR 已关闭，改动放弃</div>
+</details>
+  </div>
+</div>
+<div class="branch-row">
+  <div class="node branch-node has-conv" data-branch="feat/webhook-retry-queue">
+  
+  <div class="stage-row"><span class="stage-bar"><span class="stage-cell" title="dirty"></span><span class="stage-cell" title="unpushed"></span><span class="stage-cell" title="pushed"></span><span class="stage-cell" title="pr_open"></span><span class="stage-cell" title="merged"></span></span><span class="stage-name">分支丢失</span><span class="stage-offlabel mono">missing</span></div>
+  <div class="branch-title">Debug webhook retry queue</div>
+  <div class="branch-meta mono">
+    <span class="mono">feat/webhook-retry-queue</span>
+    
+    <span class="mono">+0/−0</span>
+    <span class="mono">agent: claude</span>
+  </div>
+  <div class="next-step empty">未写下一步</div>
+</div>
+  <div class="row-spine"></div>
+  <div class="row-convs">
+<details class="conv-chip" data-session="a7000000-0000-4000-8000-000000000009">
+  <summary>
+    <span class="verdict-sq verdict-no-clue" title="无线索"></span>
+    <span class="conv-title" title="Debug webhook retry queue">Debug webhook retry queue</span>
+    <span class="conv-time mono">8 天前</span>
+    
+    
+    <a class="open-link mono" href="claude://resume?session=a7000000-0000-4000-8000-000000000009" title="导入 CLI 会话到桌面 app" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">（无理由）</div>
+</details>
+  </div>
+</div>
+      </div>
+    </div>
+  </div>
+</section>
+<section class="project-section" data-repo="docs" hidden>
+  <div class="section-head">
+    <span class="kicker mono">§ 02 · acme/docs</span>
+    <h2 class="section-title"><span class="sq"></span>docs</h2>
+    <span class="section-stats mono">卡 2 · 待审 0 · 可关 1 · 别关对话 1</span>
+  </div>
+  <details class="archive-panel" open data-archive="ap-02" data-folder="/Users/demo/projects/docs">
+  <summary class="mono">建议归档（1）</summary>
+  
+  <div class="archive-rows">
+    <div class="archive-row">
+      <input type="checkbox" class="archive-cb" checked data-app-id="local_b2000000-0000-4000-8000-000000000002" data-title="Fix broken API reference links" onchange="boardArchiveCount(this)" />
+      <span class="verdict-sq verdict-can-close" title="可关"></span>
+      <span class="archive-title" title="Fix broken API reference links">Fix broken API reference links</span>
+      <span class="archive-reason mono">判定：分支已合并</span>
+      <a class="open-link mono" href="claude://code/continue?session=local_b2000000-0000-4000-8000-000000000002&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+    </div>
+  </div>
+  <button type="button" class="archive-btn mono" id="ap-02-btn" onclick="boardArchivePrompt('ap-02')">让 Claude 归档选中的 1 个</button>
+
+</details>
+  <div class="tree-scroll">
+    <div class="tree-grid" data-conflicts="[]">
+      <svg class="conn-svg"></svg>
+      <div class="tree-col-project">
+        <div class="node project-node">
+  <div class="node-head"><span class="sq"></span><span class="node-title">docs</span></div>
+  <div class="node-sub mono">acme/docs</div>
+  <div class="stat-line mono">卡 2</div>
+  <div class="stat-line mono">待审 0</div>
+  <div class="stat-line mono">别关对话 1</div>
+</div>
+        <div class="project-trunk-line"></div>
+      </div>
+      <div class="tree-col-rows">
+<div class="branch-row">
+  <div class="node branch-node has-conv" data-branch="docs/update-readme-install">
+  
+  <div class="stage-row"><span class="stage-bar"><span class="stage-cell" title="dirty"></span><span class="stage-cell filled stage-accent" title="unpushed"></span><span class="stage-cell" title="pushed"></span><span class="stage-cell" title="pr_open"></span><span class="stage-cell" title="merged"></span></span><span class="stage-name">未推送</span></div>
+  <div class="branch-title">Rewrite README install steps</div>
+  <div class="branch-meta mono">
+    <span class="mono">docs/update-readme-install</span>
+    
+    <span class="mono">+2/−0</span>
+    <span class="mono">agent: claude</span>
+  </div>
+  <div class="next-step empty">未写下一步</div>
+</div>
+  <div class="row-spine"></div>
+  <div class="row-convs">
+<details class="conv-chip" data-session="local_b1000000-0000-4000-8000-000000000001">
+  <summary>
+    <span class="verdict-sq verdict-keep" title="别关"></span>
+    <span class="conv-title" title="Rewrite README install steps">Rewrite README install steps</span>
+    <span class="conv-time mono">1 天前</span>
+    
+    
+    <a class="open-link mono" href="claude://code/continue?session=local_b1000000-0000-4000-8000-000000000001&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">还差一节故障排查</div>
+</details>
+  </div>
+</div>
+<div class="branch-row">
+  <div class="node branch-node has-conv" data-branch="docs/fix-api-reference-links">
+  
+  <div class="stage-row"><span class="stage-bar"><span class="stage-cell" title="dirty"></span><span class="stage-cell" title="unpushed"></span><span class="stage-cell" title="pushed"></span><span class="stage-cell" title="pr_open"></span><span class="stage-cell filled stage-ok" title="merged"></span></span><span class="stage-name">已合并</span></div>
+  <div class="branch-title">Fix broken API reference links</div>
+  <div class="branch-meta mono">
+    <span class="mono">docs/fix-api-reference-links</span>
+    
+    <span class="mono">+0/−0</span>
+    <span class="mono">agent: claude</span>
+  </div>
+  <div class="next-step empty">未写下一步</div>
+</div>
+  <div class="row-spine"></div>
+  <div class="row-convs">
+<details class="conv-chip" data-session="local_b2000000-0000-4000-8000-000000000002">
+  <summary>
+    <span class="verdict-sq verdict-can-close" title="可关"></span>
+    <span class="conv-title" title="Fix broken API reference links">Fix broken API reference links</span>
+    <span class="conv-time mono">5 天前</span>
+    
+    
+    <a class="open-link mono" href="claude://code/continue?session=local_b2000000-0000-4000-8000-000000000002&amp;source=board" title="在桌面 app 里继续这个会话" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">分支已合并</div>
+</details>
+  </div>
+</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<details class="bottom-details">
+  <summary>无分支线索（1）</summary>
+  <div class="conv-list-flat"><details class="conv-chip" data-session="c1000000-0000-4000-8000-000000000001">
+  <summary>
+    <span class="verdict-sq verdict-no-clue" title="无线索"></span>
+    <span class="conv-title" title="Random exploratory question about the build">Random exploratory question about th…</span>
+    <span class="conv-time mono">3 天前</span>
+    
+    
+    <a class="open-link mono" href="claude://resume?session=c1000000-0000-4000-8000-000000000001" title="导入 CLI 会话到桌面 app" onclick="event.stopPropagation()">打开</a>
+  </summary>
+  <div class="conv-reason mono">（无理由）</div>
+</details></div>
+</details>
+</main>
+<script type="application/json" id="board-data">{"generatedAt":"2026-09-11T09:30:00Z","projects":[{"repoName":"webapp","remote":"acme/webapp","repoRoot":"/Users/demo/projects/webapp","cards":[{"id":"T-100001","title":"Fix login form validation edge case","branch":"feat/login-form-validation","status":"doing","stage":"dirty","pr":null,"pr_state":null,"pr_url":null,"ahead":0,"behind":0,"last_commit":"abc1234","last_commit_at":"2026-09-10T00:00:00Z","agent":"claude","next_step":"","flags":[],"evidence":[],"conflicts_with":[]},{"id":"T-100002","title":"Add retry backoff for rate limits","branch":"feat/rate-limit-retry","status":"doing","stage":"unpushed","pr":null,"pr_state":null,"pr_url":null,"ahead":3,"behind":0,"last_commit":"abc1234","last_commit_at":"2026-09-10T00:00:00Z","agent":"claude","next_step":"","flags":[],"evidence":[],"conflicts_with":[]},{"id":"T-100003","title":"Add OG image stats","branch":"feat/og-image-stats","status":"doing","stage":"pushed","pr":null,"pr_state":null,"pr_url":null,"ahead":3,"behind":0,"last_commit":"abc1234","last_commit_at":"2026-09-10T00:00:00Z","agent":"claude","next_step":"","flags":[],"evidence":[],"conflicts_with":[]},{"id":"T-100004","title":"Fix checkout race on retry","branch":"feat/checkout-race-fix","status":"review","stage":"pr_open","pr":14,"pr_state":"OPEN","pr_url":"https://github.com/acme/webapp/pull/14","ahead":0,"behind":0,"last_commit":"abc1234","last_commit_at":"2026-09-10T00:00:00Z","agent":"claude","next_step":"","flags":[],"evidence":[],"conflicts_with":["feat/og-image-stats (2 files)"]},{"id":"T-100005","title":"Rewrite API error messages","branch":"feat/api-error-messages","status":"done","stage":"merged","pr":12,"pr_state":"MERGED","pr_url":"https://github.com/acme/webapp/pull/12","ahead":0,"behind":0,"last_commit":"abc1234","last_commit_at":"2026-09-10T00:00:00Z","agent":"claude","next_step":"","flags":[],"evidence":["https://github.com/acme/webapp/pull/12"],"conflicts_with":["feat/checkout-race-fix (1 files)"]},{"id":"T-100006","title":"Clean up legacy auth flow","branch":"feat/legacy-auth-cleanup","status":"dropped","stage":"closed","pr":13,"pr_state":"CLOSED","pr_url":"https://github.com/acme/webapp/pull/13","ahead":0,"behind":0,"last_commit":"abc1234","last_commit_at":"2026-09-10T00:00:00Z","agent":"claude","next_step":"","flags":[],"evidence":[],"conflicts_with":[]},{"id":"T-100007","title":"Debug webhook retry queue","branch":"feat/webhook-retry-queue","status":"blocked","stage":"missing","pr":null,"pr_state":null,"pr_url":null,"ahead":0,"behind":0,"last_commit":"abc1234","last_commit_at":"2026-09-10T00:00:00Z","agent":"claude","next_step":"","flags":["branch_missing"],"evidence":[],"conflicts_with":[]}],"sessions":[{"uuid":"a1000000-0000-4000-8000-000000000001","appSessionId":"local_a1000000-0000-4000-8000-000000000001","source":"claude","title":"Fix login form validation edge case","branches":["feat/login-form-validation"],"lastActive":"2026-09-10T15:00:00Z","pinned":false,"prInferred":false,"via":null,"inApp":true,"judge":{"verdict":"keep","reason":"还在改，本地有未提交改动"}},{"uuid":"a2000000-0000-4000-8000-000000000002","appSessionId":"local_a2000000-0000-4000-8000-000000000002","source":"claude","title":"Add retry backoff for rate limits","branches":["feat/rate-limit-retry"],"lastActive":"2026-09-10T11:00:00Z","pinned":false,"prInferred":false,"via":null,"inApp":true,"judge":{"verdict":"keep","reason":"feat/rate-limit-retry has 3 unpushed commits"}},{"uuid":"a3000000-0000-4000-8000-000000000003","appSessionId":"local_a3000000-0000-4000-8000-000000000003","source":"claude","title":"Add OG image stats","branches":["feat/og-image-stats"],"lastActive":"2026-09-09T18:00:00Z","pinned":false,"prInferred":false,"via":null,"inApp":true,"judge":{"verdict":"keep","reason":"等设计确认埋点字段"}},{"uuid":"a3000000-0000-4000-8000-000000000004","appSessionId":null,"source":"codex","title":"Add OG image stats (fork)","branches":["feat/og-image-stats"],"lastActive":"2026-09-09T09:00:00Z","pinned":false,"prInferred":false,"via":null,"inApp":true,"judge":{"verdict":"keep","reason":"codex 在跑一版对比"}},{"uuid":"a4000000-0000-4000-8000-000000000005","appSessionId":"local_a4000000-0000-4000-8000-000000000005","source":"claude","title":"Fix checkout race on retry","branches":["feat/checkout-race-fix"],"lastActive":"2026-09-10T20:00:00Z","pinned":true,"prInferred":true,"via":"hook","inApp":true,"judge":{"verdict":"keep","reason":"PR 还在等 review"}},{"uuid":"a5000000-0000-4000-8000-000000000006","appSessionId":"local_a5000000-0000-4000-8000-000000000006","source":"claude","title":"Rewrite API error messages","branches":["feat/api-error-messages"],"lastActive":"2026-09-08T10:00:00Z","pinned":true,"prInferred":true,"via":null,"inApp":true,"judge":{"verdict":"can-close","reason":"PR #12 已合并"}},{"uuid":"a5000000-0000-4000-8000-000000000007","appSessionId":"local_a5000000-0000-4000-8000-000000000007","source":"claude","title":"Add error code docs","branches":["feat/api-error-messages"],"lastActive":"2026-09-07T10:00:00Z","pinned":true,"prInferred":false,"via":null,"inApp":true,"judge":{"verdict":"can-close","reason":"分支已合并，收尾对话可以关了"}},{"uuid":"a6000000-0000-4000-8000-000000000008","appSessionId":"local_a6000000-0000-4000-8000-000000000008","source":"claude","title":"Clean up legacy auth flow","branches":["feat/legacy-auth-cleanup"],"lastActive":"2026-09-05T10:00:00Z","pinned":true,"prInferred":false,"via":null,"inApp":true,"judge":{"verdict":"can-close","reason":"PR 已关闭，改动放弃"}},{"uuid":"a7000000-0000-4000-8000-000000000009","appSessionId":null,"source":"claude","title":"Debug webhook retry queue","branches":["feat/webhook-retry-queue"],"lastActive":"2026-09-03T10:00:00Z","pinned":false,"prInferred":false,"via":null,"inApp":true,"judge":{"verdict":"no-clue","reason":null}}]},{"repoName":"docs","remote":"acme/docs","repoRoot":"/Users/demo/projects/docs","cards":[{"id":"T-200001","title":"Rewrite README install steps","branch":"docs/update-readme-install","status":"doing","stage":"unpushed","pr":null,"pr_state":null,"pr_url":null,"ahead":2,"behind":0,"last_commit":"abc1234","last_commit_at":"2026-09-10T00:00:00Z","agent":"claude","next_step":"","flags":[],"evidence":[],"conflicts_with":[]},{"id":"T-200002","title":"Fix broken API reference links","branch":"docs/fix-api-reference-links","status":"done","stage":"merged","pr":null,"pr_state":null,"pr_url":null,"ahead":0,"behind":0,"last_commit":"abc1234","last_commit_at":"2026-09-10T00:00:00Z","agent":"claude","next_step":"","flags":[],"evidence":["https://github.com/acme/docs/pull/9"],"conflicts_with":[]}],"sessions":[{"uuid":"b1000000-0000-4000-8000-000000000001","appSessionId":"local_b1000000-0000-4000-8000-000000000001","source":"claude","title":"Rewrite README install steps","branches":["docs/update-readme-install"],"lastActive":"2026-09-10T08:00:00Z","pinned":false,"prInferred":false,"via":null,"inApp":true,"judge":{"verdict":"keep","reason":"还差一节故障排查"}},{"uuid":"b2000000-0000-4000-8000-000000000002","appSessionId":"local_b2000000-0000-4000-8000-000000000002","source":"claude","title":"Fix broken API reference links","branches":["docs/fix-api-reference-links"],"lastActive":"2026-09-06T08:00:00Z","pinned":false,"prInferred":false,"via":null,"inApp":true,"judge":{"verdict":"can-close","reason":"分支已合并"}}]}],"noClueSessions":[{"uuid":"c1000000-0000-4000-8000-000000000001","appSessionId":null,"source":"claude","title":"Random exploratory question about the build","branches":[],"lastActive":"2026-09-08T12:00:00Z","pinned":false,"prInferred":false,"via":null,"inApp":true,"judge":{"verdict":"no-clue","reason":null}}],"summary":{"repos":2,"cards":9,"sessions":11,"pinned":4,"pinnedCanClose":3}}</script>
+</body>
+</html>
