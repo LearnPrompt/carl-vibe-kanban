@@ -17,6 +17,7 @@ description: 跨仓库任务板：对话 → 分支 → 落地。用户问某个
 4. **结束一段工作**：`board evidence <id> <PR链接|截图路径|测试输出路径>`，再 `board next <id>` 写下一步或「等卡尔过目」，最后 `board sync`。没有 evidence 的 done 卡不亮绿。
 5. **给人看**：`board render --all`，用 headless Chrome 截 `~/agent-workbench/board/index.html` 发给用户。
 6. **合并后的收尾**：`board cleanup --all` 列出已合并却还留着 worktree 的卡；用户点头后 `board cleanup --all --apply` 删 worktree 和本地分支，有脏文件或未 push 的会被拒绝，别用 `--force` 绕过，把拒绝原因告诉用户。
+7. **卡片入库的仓，同步后要落盘**：`board/` 已经纳入 git（`git ls-files -- board/` 非空）的仓，`sync` 之后跑 `board commit --push` 把刷新的卡片提交进主干；只碰 `board/tasks`、`board/archive`、`board/board.config.json`，不会碰同一工作树里别的未提交改动。定时刷新交给 `board schedule install`（macOS LaunchAgent，默认早晚各一次），agent 自己不要再手搭 cron 或 launchd job。
 
 ## 三条进门的路
 
@@ -64,4 +65,4 @@ Codex 里没有 app 的会话工具，只做第 1 步给清单。
 - 在任何 worktree 里跑，卡都写进该仓主工作树的 `board/`；`BOARD_HOME` 可覆盖数据目录。
 - `board dispatch` 默认只打印启动命令，`--run` 才真起 agent 进程。
 - 仓库级 `board/board.config.json` 不含可执行内容；`on_done` 钩子与工作区仓库列表在 `~/.config/board/config.json`。
-- 各仓 `board/` 目录要不要提交进 git 由用户决定，agent 不替用户 commit 它。
+- 各仓 `board/` 目录要不要提交进 git 由用户决定，agent 不替用户 commit 它；`board commit` 对没把 `board/` 纳入 git 的仓一律 SKIP（`卡片未入库`），不会替用户做这个决定。

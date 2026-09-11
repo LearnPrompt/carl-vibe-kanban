@@ -72,6 +72,8 @@ board mcp install      # 注册 MCP 到 Claude Code 与 Codex
 | `next <id> "…"` / `evidence <id> …` / `pin <id> <status>` | 写人工字段 |
 | `dispatch <branch> --agent claude` | 建 worktree、拷 `.env.local`、落卡，只打印启动命令 |
 | `cleanup [--all] [--apply]` / `done <id>` | 删已合并分支的 worktree 和本地分支，脏文件或未 push 一律拒绝 |
+| `commit [--all] [--push]` | 把刷新后的卡片提交进主干，只碰 `board/`；未入库的仓一律跳过 |
+| `schedule install [--at HH:MM ...]` / `status` / `uninstall` | 装/查/卸 macOS LaunchAgent，定期 sync + commit --push + render |
 | `render [--all]` | 生成静态页 |
 | `hooks install` / `mcp install` | 接入 Claude Code 与 Codex |
 | `import vibe-kanban` | 从 vibe-kanban 本地库导入任务 |
@@ -210,6 +212,8 @@ Requires Node 20+ and the `gh` CLI. Zero npm dependencies.
 | `next` / `evidence` / `pin` | Write the manual fields |
 | `dispatch <branch> --agent claude` | Create worktree, copy `.env.local`, write the card, print the launch command |
 | `cleanup [--all] [--apply]` / `done <id>` | Remove worktrees and local branches of merged work; refuses dirty or unpushed |
+| `commit [--all] [--push]` | Commit refreshed cards into the default branch, touching only `board/`; skips repos that never tracked it |
+| `schedule install [--at HH:MM ...]` / `status` / `uninstall` | Install/check/remove a macOS LaunchAgent that runs sync + commit --push + render on a schedule |
 | `render [--all]` | Generate the page |
 | `hooks install` / `mcp install` | Wire into Claude Code and Codex |
 | `import vibe-kanban` | Import tasks from a local vibe-kanban database |

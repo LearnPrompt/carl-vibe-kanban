@@ -14,6 +14,8 @@ import * as sessionsLib from "../lib/sessions.mjs";
 import * as hooksLib from "../lib/hooks.mjs";
 import * as mcpLib from "../lib/mcp.mjs";
 import * as importVkLib from "../lib/import-vibe-kanban.mjs";
+import * as commitLib from "../lib/commit.mjs";
+import * as scheduleLib from "../lib/schedule.mjs";
 
 const DEFAULT_CONFIG = {
   base: "main",
@@ -971,6 +973,132 @@ function cmdDone(id, flags) {
   }
 }
 
+// --- commit (board-commit spec) ------------------------------------------------
+//
+// Commits `board sync`-refreshed cards into the repo's own main worktree,
+// touching ONLY board/tasks, board/archive, board/board.config.json — the
+// main worktree routinely has other sessions' unrelated staged/unstaged
+// changes sitting in it, so this never stashes and never adds anything
+// outside those three paths. See lib/commit.mjs for the per-repo logic.
+
+function cmdCommit(flags) {
+  const opts = { push: !!flags.push, dryRun: !!flags["dry-run"] };
+
+  if (isWorkspaceMode(flags) || flags.repo) {
+    if (flags.repo) validateRepoFlag(flags.repo);
+    forEachWorkspaceRepo((probe) => {
+      if (flags.repo && probe.repoLabel !== flags.repo) return;
+      console.log(commitLib.runCommitForRepo(probe.repoRoot, probe.repoLabel, opts));
+    });
+    return;
+  }
+
+  const boardRoot = resolveBoardRoot();
+  const repoLabel = resolveRepoLabel(boardRoot);
+  console.log(commitLib.runCommitForRepo(boardRoot, repoLabel, opts));
+}
+
+// --- schedule (macOS LaunchAgent for periodic sync+commit+render) --------------
+
+function cmdScheduleInstall(flags) {
+  const atValues = [];
+  // parseFlags collapses repeated `--at` into a single string (last wins) —
+  // scan the raw argv ourselves so `--at 09:00 --at 21:00` both survive.
+  const raw = process.argv.slice(2);
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === "--at" && raw[i + 1]) atValues.push(raw[i + 1]);
+  }
+  const times = atValues.length > 0 ? atValues : ["09:00", "21:00"];
+
+  for (const t of times) {
+    if (!scheduleLib.isValidTime(t)) {
+      console.error(`非法时刻 --at ${t}，需要 HH:MM 格式`);
+      process.exit(1);
+    }
+  }
+
+  if (process.platform !== "darwin") {
+    console.log("非 macOS，未自动写入。等价 crontab 行：");
+    for (const t of times) {
+      console.log(scheduleLib.buildCrontabLine(t));
+    }
+    return;
+  }
+
+  const plist = scheduleLib.buildPlistForTimes({
+    label: scheduleLib.LABEL,
+    times,
+    nodeBinDir: path.dirname(process.execPath),
+    home: os.homedir(),
+    user: os.userInfo().username,
+    logPath: scheduleLib.defaultLogPath(),
+  });
+  const plistPath = scheduleLib.plistPath();
+
+  if (fs.existsSync(plistPath)) {
+    const existing = fs.readFileSync(plistPath, "utf8");
+    if (existing === plist) {
+      console.log(`已装好，内容未变，跳过: ${plistPath}`);
+      return;
+    }
+  }
+
+  fs.mkdirSync(path.dirname(plistPath), { recursive: true });
+  fs.writeFileSync(plistPath, plist, "utf8");
+
+  const uid = execSync("id -u").toString().trim();
+  spawnSync("launchctl", ["bootout", `gui/${uid}/${scheduleLib.LABEL}`], { stdio: "ignore" });
+  const bootstrap = spawnSync("launchctl", ["bootstrap", `gui/${uid}`, plistPath], { encoding: "utf8" });
+  if (bootstrap.status !== 0) {
+    console.error(`launchctl bootstrap 失败: ${(bootstrap.stderr || "").trim()}`);
+    process.exit(1);
+  }
+  console.log(`已装: ${plistPath}`);
+  console.log(`触发时刻: ${times.join(", ")}`);
+  console.log(`日志: ${scheduleLib.defaultLogPath()}`);
+}
+
+function cmdScheduleStatus() {
+  const plistPath = scheduleLib.plistPath();
+  if (!fs.existsSync(plistPath)) {
+    console.log(`未安装（找不到 ${plistPath}）`);
+    return;
+  }
+  console.log(`已安装: ${plistPath}`);
+  const content = fs.readFileSync(plistPath, "utf8");
+  const times = scheduleLib.parseTimesFromPlist(content);
+  console.log(`触发时刻: ${times.length ? times.join(", ") : "(解析不出)"}`);
+
+  const uid = execSync("id -u").toString().trim();
+  const print = spawnSync("launchctl", ["print", `gui/${uid}/${scheduleLib.LABEL}`], { encoding: "utf8" });
+  if (print.status === 0) {
+    console.log("launchctl: 已加载");
+  } else {
+    console.log("launchctl: 未加载（装了 plist 但没 bootstrap，或已被移除）");
+  }
+
+  const logPath = scheduleLib.defaultLogPath();
+  if (fs.existsSync(logPath)) {
+    const lines = fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean);
+    console.log(`日志最后 ${Math.min(10, lines.length)} 行 (${logPath}):`);
+    for (const l of lines.slice(-10)) console.log(`  ${l}`);
+  } else {
+    console.log(`日志尚不存在: ${logPath}`);
+  }
+}
+
+function cmdScheduleUninstall() {
+  const plistPath = scheduleLib.plistPath();
+  const uid = execSync("id -u").toString().trim();
+  spawnSync("launchctl", ["bootout", `gui/${uid}/${scheduleLib.LABEL}`], { stdio: "ignore" });
+  if (fs.existsSync(plistPath)) {
+    fs.unlinkSync(plistPath);
+    console.log(`已卸载并删除: ${plistPath}`);
+  } else {
+    console.log("未安装，无需卸载");
+  }
+}
+
 // --- init ---------------------------------------------------------------------
 
 // Scans ~/projects/* for directories that look like git repos (a `.git` file
@@ -1800,6 +1928,12 @@ function printHelp() {
   hooks status                                 查看两边是否装好、事件日志条数与最近一条时间
   cleanup [--all] [--apply] [--force]          清理 merged/closed/dropped 且带 worktree 的卡（默认 dry-run）
   done <id> [--force]                          等价于对单张卡跑 cleanup --apply
+  commit [--all] [--repo x] [--push] [--dry-run]   把刷新后的卡片提交进主干（仅 board/tasks、board/archive、
+                                                board/board.config.json；未把 board/ 纳入 git 的仓一律 SKIP；
+                                                只在主工作树当前分支就是主干时才提交；--push 推一次，被拒重试一次）
+  schedule <install [--at HH:MM ...]|status|uninstall>
+                                                装/查/卸 macOS LaunchAgent，定期跑 sync+commit --push+render
+                                                （默认两次：09:00、21:00；非 macOS 只打印等价 crontab 行）
   mcp                                          启动 stdio 上的 MCP server
   mcp install [--dry-run]                      注册到 Claude Code / Codex 的 MCP 配置
   --help                                       显示本帮助
@@ -2011,6 +2145,25 @@ async function main() {
           cmdHooksStatus();
         } else {
           console.error("用法: board hooks <install [--dry-run]|status>");
+          process.exit(1);
+        }
+        break;
+      }
+      case "commit": {
+        const { flags } = parseFlags(rest);
+        cmdCommit(flags);
+        break;
+      }
+      case "schedule": {
+        const [sub, ...subRest] = rest;
+        if (sub === "install") {
+          cmdScheduleInstall();
+        } else if (sub === "status") {
+          cmdScheduleStatus();
+        } else if (sub === "uninstall") {
+          cmdScheduleUninstall();
+        } else {
+          console.error("用法: board schedule <install [--at HH:MM ...]|status|uninstall>");
           process.exit(1);
         }
         break;
